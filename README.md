@@ -1,4 +1,6 @@
-# Debian 13 (trixie) for the Samsung Galaxy Tab S9 Ultra (SM-X910 / gts9uwifi)
+# ATTENTION: THIS WAS VIBE CODED USING AI AGENTS, USE IT AT YOUR OWN RISK AND DISCRETION.
+
+## Debian 13 (trixie) for the Samsung Galaxy Tab S9 Ultra (SM-X910 / gts9uwifi)
 
 A **Debian** ROM for the Galaxy Tab S9 Ultra, built from this repository.
 
