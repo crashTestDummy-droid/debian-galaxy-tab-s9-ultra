@@ -1,0 +1,592 @@
+#!/sbin/sh
+# Boot bundle and root filesystem installer for the SM-X910 only, Debian
+# variant.
+#
+# Derived from the postmarketOS gts9uwifi installer (MIT).  Differences: it
+# also installs the Debian root filesystem into the tablet's internal storage,
+# it must identify the rootfs as Debian, and systemd units are enabled from a
+# packaged manifest rather than one hardcoded service.
+#
+# It writes boot, init_boot, vendor_boot and dtbo.  It writes vbmeta only when
+# the recovery kernel exposes it read-write; otherwise it requires AVB flags 2
+# and preserves the existing vbmeta.  When the ZIP carries a root filesystem
+# image it also writes that image into `linuxroot` if that partition exists,
+# and otherwise into `userdata`, whose Android contents are then replaced by
+# Debian.
+#
+# On a split tablet it also seeds the dual-boot sets inside the root filesystem
+# it just wrote, in the one moment when both systems' boot images exist at once
+# — Android's are still in the partitions, Debian's are in the ZIP — and reads
+# Android's name by mounting `super`'s system read-only.  All of that is best
+# effort and never fails the installation.
+#
+# What it never does, on any path: create, delete, move or resize a partition;
+# run mkfs, wipefs, sgdisk, parted or format anything; touch super, recovery,
+# the bootloader chain, PIT/GPT, EFS, persist, modem or any calibration
+# partition; or reboot.  The GPT Samsung shipped is left byte for byte as it
+# is, which is what keeps an Odin restore a one-step operation.
+
+# Machine-readable contract, asserted by scripts/validate-bundle.sh.  Prose in
+# the comments above can be reworded freely; this line is what identifies the
+# installer, so a build cannot silently package a different one.
+# GTS9U-INSTALLER-CONTRACT: writes boot init_boot vendor_boot dtbo vbmeta linuxroot userdata only
+
+OUTFD=$2
+ZIPFILE=$3
+ROOTFS_MOUNTED=0
+ROOTFS_MOUNT=/tmp/linux-root
+ROOTFS_LABEL=UBTS9U_UFS
+
+ui_print() {
+    echo "ui_print $1" >> /proc/self/fd/$OUTFD
+    echo "ui_print" >> /proc/self/fd/$OUTFD
+}
+
+abort() {
+    if [ "$ROOTFS_MOUNTED" -eq 1 ]; then
+        sync
+        umount "$ROOTFS_MOUNT" >/dev/null 2>&1 || true
+        ROOTFS_MOUNTED=0
+    fi
+    ui_print "ERROR: $1"
+    ui_print "Installation aborted. Reboot to recovery, not system."
+    exit 1
+}
+
+BUNDLE_LABEL="$(unzip -p "$ZIPFILE" BUNDLE-LABEL 2>/dev/null)"
+[ -n "$BUNDLE_LABEL" ] || BUNDLE_LABEL="unnamed SM-X910 boot bundle"
+ui_print "---------------------------------------"
+ui_print " $BUNDLE_LABEL"
+ui_print "---------------------------------------"
+
+DEVICE_CODENAME="$(getprop ro.product.device)"
+EM_MODEL="$(getprop ro.boot.em.model)"
+BOOTLOADER="$(getprop ro.bootloader)"
+
+case "$DEVICE_CODENAME" in
+    gts9u|gts9uwifi) ;;
+    *) abort "Expected gts9u/gts9uwifi; got '$DEVICE_CODENAME'" ;;
+esac
+
+if [ -n "$EM_MODEL" ] && [ "$EM_MODEL" != "SM-X910" ]; then
+    abort "Expected SM-X910; got '$EM_MODEL'"
+fi
+if [ -z "$EM_MODEL" ]; then
+    case "$BOOTLOADER" in
+        X910*) ui_print "em.model empty; X910 bootloader accepted" ;;
+        *) abort "Cannot positively identify SM-X910" ;;
+    esac
+fi
+
+BB=/dev/block/by-name
+SLOT="$(getprop ro.boot.slot_suffix)"
+
+resolve_part() {
+    if [ -n "$SLOT" ] && [ -e "$BB/$1$SLOT" ]; then
+        echo "$BB/$1$SLOT"
+    elif [ -e "$BB/$1" ]; then
+        echo "$BB/$1"
+    else
+        return 1
+    fi
+}
+
+for part in boot init_boot vendor_boot dtbo vbmeta; do
+    resolve_part "$part" >/dev/null || abort "Missing partition $part"
+done
+
+blkdev_size() { blockdev --getsize64 "$1" 2>/dev/null || echo 0; }
+[ "$(blkdev_size "$(resolve_part boot)")" -eq 100663296 ] || abort "boot size mismatch"
+[ "$(blkdev_size "$(resolve_part init_boot)")" -eq 8388608 ] || abort "init_boot size mismatch"
+[ "$(blkdev_size "$(resolve_part vendor_boot)")" -eq 100663296 ] || abort "vendor_boot size mismatch"
+[ "$(blkdev_size "$(resolve_part dtbo)")" -eq 16777216 ] || abort "dtbo size mismatch"
+[ "$(blkdev_size "$(resolve_part vbmeta)")" -eq 131072 ] || abort "vbmeta size mismatch"
+
+# TWRP's unzip is AOSP ziptool, and `unzip -l ZIP MEMBER` exits 0 whether or
+# not MEMBER is in the archive: asked for something absent it prints "0 files"
+# and reports success.  Every membership test written that way is not a test at
+# all, and one of them decided this installer was carrying an overlay it did
+# not have.  Ask the listing itself instead, exactly once.
+ZIP_LISTING=/tmp/gts9u-zip-listing
+unzip -l "$ZIPFILE" > "$ZIP_LISTING" 2>/dev/null || abort "cannot read the ZIP"
+
+zip_has() {
+    awk -v name="$1" '$NF == name { found = 1 } END { exit !found }' "$ZIP_LISTING"
+}
+
+for file in boot.img init_boot.img vendor_boot.img dtbo.img vbmeta.img; do
+    zip_has "$file" || abort "ZIP is missing $file"
+done
+
+BOOT_SETS_DIR=/var/lib/gts9u-boot-sets
+SUPER_MOUNT=/tmp/gts9u-super
+
+# Is the tablet currently set to boot this port's Debian?
+#
+# It matters because the images about to be saved as "the way back to Android"
+# are simply whatever is in the boot partitions, and on a reinstall over an
+# existing dual boot that is Debian.  Saving those under Android's name would
+# produce a switcher entry that claims to be One UI and boots Linux.
+#
+# The marker is not incidental: `root=LABEL=UBTS9U_UFS` in vendor_boot's kernel
+# command line is the thing that makes this the port's Linux boot image at all.
+# Samsung's says nothing of the sort.
+booting_linux() {
+    node="$(resolve_part vendor_boot)" || return 1
+    dd if="$node" bs=4096 count=1 2>/dev/null | tr -d '\0' | \
+        grep -q "root=LABEL=$ROOTFS_LABEL"
+}
+
+# What the installed Android calls itself, read from its own build.prop.
+#
+# Best effort by design: it only decides a label.  When it finds nothing the
+# set is left unnamed and whichever Android boots first writes its own name.
+android_name() {
+    for node in /dev/block/mapper/system /dev/block/mapper/system_a \
+                /dev/block/mapper/system_b; do
+        [ -e "$node" ] || continue
+        mkdir -p "$SUPER_MOUNT" 2>/dev/null
+        mount -o ro "$node" "$SUPER_MOUNT" 2>/dev/null || continue
+
+        for prop in "$SUPER_MOUNT/system/build.prop" "$SUPER_MOUNT/build.prop"; do
+            [ -f "$prop" ] || continue
+
+            value="$(sed -n 's/^ro\.lineage\.display\.version=//p' "$prop" | head -n 1)"
+            [ -n "$value" ] || \
+                value="$(sed -n 's/^ro\.lineage\.version=//p' "$prop" | head -n 1)"
+            if [ -n "$value" ]; then
+                umount "$SUPER_MOUNT" 2>/dev/null
+                echo "LineageOS $value"
+                return 0
+            fi
+
+            # One UI encodes its version as major*10000 + minor*100 + patch,
+            # so 80000 is 8.0.  Small enough for mksh to divide safely.
+            oneui="$(sed -n 's/^ro\.build\.version\.oneui=//p' "$prop" | head -n 1)"
+            case "$oneui" in
+                ''|*[!0-9]*) ;;
+                *)
+                    umount "$SUPER_MOUNT" 2>/dev/null
+                    minor=$(( (oneui % 10000) / 100 ))
+                    if [ "$minor" -eq 0 ]; then
+                        echo "One UI $(( oneui / 10000 ))"
+                    else
+                        echo "One UI $(( oneui / 10000 )).$minor"
+                    fi
+                    return 0
+                    ;;
+            esac
+
+            release="$(sed -n 's/^ro\.build\.version\.release=//p' "$prop" | head -n 1)"
+            if [ -n "$release" ]; then
+                umount "$SUPER_MOUNT" 2>/dev/null
+                echo "Android $release"
+                return 0
+            fi
+        done
+
+        umount "$SUPER_MOUNT" 2>/dev/null
+    done
+    return 1
+}
+
+# Seeds the dual-boot sets inside the Debian root filesystem just written.
+#
+# Called with the boot partitions still holding Android's images.  Never
+# aborts: everything here is a convenience that the switchers can rebuild
+# themselves from a running system.
+seed_boot_sets() {
+    if booting_linux; then
+        ui_print "The boot partitions already hold Debian, so there is no"
+        ui_print "Android boot set to save. Save it from Android instead."
+        SEED_ANDROID=0
+    else
+        SEED_ANDROID=1
+    fi
+
+    mkdir -p "$ROOTFS_MOUNT" 2>/dev/null
+    if grep -q " $ROOTFS_MOUNT " /proc/mounts 2>/dev/null; then
+        umount "$ROOTFS_MOUNT" 2>/dev/null
+    fi
+    if ! mount -t ext4 -o rw "$DATA_TARGET" "$ROOTFS_MOUNT" 2>/dev/null; then
+        ui_print "Cannot mount the new root filesystem to save the boot sets."
+        return 0
+    fi
+
+    # The four images are 216 MiB together and TWO sets get written here, Debian's
+    # and Android's, so the real bill is 432 MiB.  This asked for 256 for a long
+    # time, which is enough for the first set and not the second: Debian's landed,
+    # Android's ran out of room half way, and the cleanup below removed it -- a
+    # tablet that looked installed but could not switch.  Android's set is the one
+    # that cannot be rebuilt later, so refusing early beats seeding half of it.
+    free_kb="$(df -k "$ROOTFS_MOUNT" 2>/dev/null | tail -n 1 | awk '{print $4}')"
+    case "$free_kb" in
+        ''|*[!0-9]*) free_kb=0 ;;
+    esac
+    if [ "$free_kb" -lt 491520 ]; then
+        ui_print "Not enough room in the new root filesystem for the boot"
+        ui_print "sets yet. Save them from either system once it has grown."
+        umount "$ROOTFS_MOUNT" 2>/dev/null
+        return 0
+    fi
+
+    ui_print "Saving the boot sets for switching systems..."
+    # The Linux side's set id is kept as 'ubuntu': the companion's
+    # boot_core looks for /var/lib/gts9u-boot-sets/ubuntu, so renaming it
+    # would silently break switching.
+    mkdir -p "$ROOTFS_MOUNT$BOOT_SETS_DIR/ubuntu" 2>/dev/null
+    for part in boot init_boot vendor_boot dtbo; do
+        unzip -p "$ZIPFILE" "$part.img" \
+            > "$ROOTFS_MOUNT$BOOT_SETS_DIR/ubuntu/$part.img" 2>/dev/null || {
+                ui_print "Could not save the Debian boot set."
+                rm -rf "$ROOTFS_MOUNT$BOOT_SETS_DIR/ubuntu"
+                break
+            }
+    done
+
+    if [ "$SEED_ANDROID" -eq 1 ]; then
+        mkdir -p "$ROOTFS_MOUNT$BOOT_SETS_DIR/android" 2>/dev/null
+        for part in boot init_boot vendor_boot dtbo; do
+            node="$(resolve_part "$part")" || continue
+            dd if="$node" of="$ROOTFS_MOUNT$BOOT_SETS_DIR/android/$part.img" \
+                bs=4M 2>/dev/null || {
+                    ui_print "Could not save the Android boot set."
+                    rm -rf "$ROOTFS_MOUNT$BOOT_SETS_DIR/android"
+                    break
+                }
+        done
+        if [ -d "$ROOTFS_MOUNT$BOOT_SETS_DIR/android" ]; then
+            name="$(android_name)" || name=""
+            if [ -n "$name" ]; then
+                echo "$name" > "$ROOTFS_MOUNT$BOOT_SETS_DIR/android/name.txt"
+                ui_print "Android is $name; you can switch back to it."
+            else
+                ui_print "Saved the Android boot set; it will name itself on"
+                ui_print "its first boot."
+            fi
+        fi
+    fi
+
+    sync
+    umount "$ROOTFS_MOUNT" 2>/dev/null
+    return 0
+}
+
+fs_label() {
+    # This TWRP ships neither blkid nor findfs, and has no /dev/disk/by-label,
+    # but it does have tune2fs.  Try the usual tools first so the installer
+    # still works on a recovery that has them, then fall back.
+    if command -v blkid >/dev/null 2>&1; then
+        blkid -s LABEL -o value "$1" 2>/dev/null && return 0
+    fi
+    tune2fs -l "$1" 2>/dev/null | \
+        sed -n 's/^Filesystem volume name:[[:space:]]*//p'
+}
+
+# ---------------------------------------------------------------------------
+# The Debian root filesystem target
+# ---------------------------------------------------------------------------
+#
+# Debian's root filesystem goes into `linuxroot` when that partition exists,
+# and into the partition Android calls `userdata` when it does not.
+#
+# That fallback is the whole point, not a leftover.  A tablet that has been
+# split by the repartitioning ZIP gets Debian beside Android, and one that has
+# never been split gets Debian over Android's user data — which is what
+# somebody who only wants Linux on the whole UFS is asking for, and it means
+# they need no repartitioning step at all.  Either way the partition table is
+# not touched here, Android's system image in super is not touched, and the way
+# back is an Odin flash.
+
+HAS_ROOTFS_IMAGE=0
+if zip_has rootfs.img; then
+    HAS_ROOTFS_IMAGE=1
+    zip_has ROOTFS-IMAGE || \
+        abort "the ZIP carries rootfs.img without its ROOTFS-IMAGE manifest"
+fi
+
+ROOT_PART=linuxroot
+DATA_TARGET="$(resolve_part linuxroot)" || DATA_TARGET=""
+if [ -z "$DATA_TARGET" ]; then
+    ROOT_PART=userdata
+    DATA_TARGET="$(resolve_part userdata)" || DATA_TARGET=""
+fi
+
+if [ "$HAS_ROOTFS_IMAGE" -eq 1 ]; then
+    [ -n "$DATA_TARGET" ] || \
+        abort "no linuxroot or userdata partition to install Debian into"
+    ui_print "Installing into $ROOT_PART."
+
+    # The ZIP is read while its own filesystem is being overwritten if it sits
+    # on the target.  TWRP's "internal storage" is exactly that partition, so
+    # this is the likely mistake and not an exotic one; it would destroy the
+    # installer halfway through the write.  It only applies when userdata is
+    # the target: on a split tablet Android keeps its own userdata and the ZIP
+    # may legitimately live there.
+    if [ "$ROOT_PART" = userdata ]; then
+        case "$ZIPFILE" in
+            /data/*|/sdcard/*|/mnt/sdcard/*|/storage/emulated/*)
+                ui_print "This ZIP is at $ZIPFILE, on the partition being replaced."
+                ui_print "Copy it to a microSD or a USB-OTG drive and flash it"
+                ui_print "from there."
+                abort "the ZIP is stored on the installation target"
+                ;;
+        esac
+    fi
+
+    # Everything below counts in MiB, and that is not tidiness: TWRP runs this
+    # script with mksh, whose arithmetic and test(1) are 32-bit signed.  A
+    # 3 271 557 120 byte image wraps to a negative number there, so `-gt 0` on
+    # the byte count rejects a perfectly good ZIP.  That is exactly how v0.18
+    # failed its first flash.  No value here may exceed 2 GiB.
+    ROOTFS_LINE="$(unzip -p "$ZIPFILE" ROOTFS-IMAGE 2>/dev/null)"
+    ROOTFS_SHA="$(echo "$ROOTFS_LINE" | cut -d' ' -f1)"
+    ROOTFS_MIB="$(echo "$ROOTFS_LINE" | cut -d' ' -f3)"
+    [ "${#ROOTFS_SHA}" -eq 64 ] || abort "malformed rootfs image manifest"
+    [ "$ROOTFS_MIB" -gt 0 ] 2>/dev/null || abort "malformed rootfs image size"
+
+    # Does the target really extend past the end of the image?  Reading the
+    # last MiB the image will occupy answers that without naming the size of
+    # the partition, which is a number no shell here can hold: a partition that
+    # stops short returns fewer bytes, or none at all.
+    PROBE="$(dd if="$DATA_TARGET" bs=1M skip=$((ROOTFS_MIB - 1)) count=1 \
+        2>/dev/null | wc -c)"
+    [ "$PROBE" -eq 1048576 ] || \
+        abort "$ROOT_PART is smaller than the $ROOTFS_MIB MiB image"
+
+    # A partition that is still mounted would be written underneath a live
+    # filesystem, and TWRP would then flush its own stale cache over what we
+    # just wrote.  TWRP does mount this one: it offers it as "Internal
+    # Storage".
+    #
+    # /proc/mounts names the resolved device, never the by-name symlink, so
+    # both spellings have to be matched or the loop below quietly finds
+    # nothing.
+    DATA_REAL="$(readlink -f "$DATA_TARGET" 2>/dev/null)"
+    [ -n "$DATA_REAL" ] || DATA_REAL="$DATA_TARGET"
+
+    data_mountpoints() {
+        while read device mountpoint rest; do
+            case "$device" in
+                "$DATA_TARGET"|"$DATA_REAL") echo "$mountpoint" ;;
+            esac
+        done < /proc/mounts
+    }
+
+    for mountpoint in $(data_mountpoints); do
+        ui_print "Unmounting $mountpoint before writing Debian."
+        # Plain umount, not lazy: a lazy unmount detaches the name but leaves
+        # the filesystem live, which is precisely the cache that would land on
+        # top of the image afterwards.
+        umount "$mountpoint" || umount -f "$mountpoint" || \
+            abort "cannot unmount $mountpoint; nothing has been written"
+    done
+
+    remaining="$(data_mountpoints)"
+    [ -z "$remaining" ] || \
+        abort "$ROOT_PART is still mounted at $remaining; nothing has been written"
+fi
+
+VBMETA_TARGET="$(resolve_part vbmeta)"
+VBMETA_READ_ONLY="$(blockdev --getro "$VBMETA_TARGET" 2>/dev/null || echo 1)"
+SKIP_VBMETA=0
+if [ "$VBMETA_READ_ONLY" = "1" ]; then
+    VBMETA_FLAGS="$(dd if="$VBMETA_TARGET" bs=1 skip=120 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    [ "$VBMETA_FLAGS" = "00000002" ] || \
+        abort "vbmeta is read-only and does not have AVB flags 2"
+    SKIP_VBMETA=1
+fi
+
+# ---------------------------------------------------------------------------
+# An update ZIP with no image refreshes the installed system in place
+# ---------------------------------------------------------------------------
+
+HAS_ROOTFS_OVERLAY=0
+if zip_has ROOTFS-OVERLAY-SHA256SUMS; then
+    [ "$HAS_ROOTFS_IMAGE" -eq 0 ] || \
+        abort "the ZIP carries both a rootfs image and an overlay"
+    HAS_ROOTFS_OVERLAY=1
+    [ -n "$DATA_TARGET" ] || abort "no linuxroot or userdata partition to update"
+    # On a split tablet linuxroot exists but may not be the installed root, so
+    # fall back to userdata rather than refusing an update that would work.
+    if [ "$(fs_label "$DATA_TARGET")" != "$ROOTFS_LABEL" ] && \
+       [ "$ROOT_PART" = linuxroot ]; then
+        FALLBACK="$(resolve_part userdata)" || FALLBACK=""
+        if [ -n "$FALLBACK" ] && \
+           [ "$(fs_label "$FALLBACK")" = "$ROOTFS_LABEL" ]; then
+            ROOT_PART=userdata
+            DATA_TARGET="$FALLBACK"
+        fi
+    fi
+    [ "$(fs_label "$DATA_TARGET")" = "$ROOTFS_LABEL" ] || \
+        abort "$ROOT_PART does not hold a Debian root labelled $ROOTFS_LABEL"
+    ui_print "Updating the Debian root filesystem in $ROOT_PART."
+
+    # Never mount a known-dirty rootfs read-write and then install a new boot
+    # bundle over it.  A v0.8 test boot reached systemd but fell into the
+    # emergency target because ext4 contained unattached inodes; the black
+    # panel made that look like a kernel regression.  e2fsck -p performs only
+    # repairs that ext4 considers safe without operator input.  Anything more
+    # serious is left untouched and requires an explicit recovery pass.
+    command -v e2fsck >/dev/null 2>&1 || \
+        abort "TWRP has no e2fsck; cannot validate the Debian rootfs safely"
+    ui_print "Checking the installed Debian root filesystem."
+    e2fsck -p "$DATA_TARGET" >/tmp/linux-rootfs-fsck.log 2>&1
+    rc=$?
+    case "$rc" in
+        0) ui_print "The Debian root filesystem is clean." ;;
+        1) ui_print "It had safe errors; e2fsck repaired them." ;;
+        *)
+            ui_print "e2fsck could not repair the rootfs automatically (code $rc)."
+            ui_print "Run e2fsck manually from TWRP before flashing again."
+            abort "the Debian root filesystem needs manual repair"
+            ;;
+    esac
+
+    mkdir -p "$ROOTFS_MOUNT" || abort "cannot create the mount point"
+    EXISTING_MOUNT="$(grep "^$DATA_TARGET " /proc/mounts 2>/dev/null | head -n 1 | cut -d' ' -f2)"
+    if [ -n "$EXISTING_MOUNT" ]; then
+        ui_print "Unmounting stale mount at $EXISTING_MOUNT."
+        umount "$EXISTING_MOUNT" || abort "cannot unmount $EXISTING_MOUNT"
+    fi
+    if grep -q " $ROOTFS_MOUNT " /proc/mounts 2>/dev/null; then
+        umount "$ROOTFS_MOUNT" || abort "cannot clear stale rootfs mount point"
+    fi
+    mount -t ext4 -o rw "$DATA_TARGET" "$ROOTFS_MOUNT" || \
+        abort "cannot mount the Debian root filesystem read-write"
+    ROOTFS_MOUNTED=1
+    [ -f "$ROOTFS_MOUNT/etc/os-release" ] || abort "the root filesystem has no /etc/os-release"
+    grep -q '^ID=debian$' "$ROOTFS_MOUNT/etc/os-release" || \
+        grep -q '^ID="debian"$' "$ROOTFS_MOUNT/etc/os-release" || \
+        abort "the installed root filesystem is not Debian"
+    ui_print "Validated the installed Debian root filesystem."
+fi
+
+# ---------------------------------------------------------------------------
+# Writes
+# ---------------------------------------------------------------------------
+
+if [ "$HAS_ROOTFS_IMAGE" -eq 1 ]; then
+    ui_print "Debian will be written into $ROOT_PART ($ROOTFS_MIB MiB)."
+    if [ "$ROOT_PART" = userdata ]; then
+        ui_print "Everything Android kept there is replaced."
+    else
+        ui_print "Android keeps its own userdata untouched."
+    fi
+elif [ "$HAS_ROOTFS_OVERLAY" -eq 1 ]; then
+    ui_print "Kernel modules, configuration and firmware will be updated"
+    ui_print "on the installed Debian root filesystem."
+else
+    ui_print "No filesystem or user-data partition will be touched."
+fi
+
+# The root filesystem goes first.  If it fails, the tablet still has the boot
+# images it had before, so it is one retry away from where it started rather
+# than holding a new kernel with no system to boot.
+if [ "$HAS_ROOTFS_IMAGE" -eq 1 ]; then
+    ui_print "Writing the Debian root filesystem. This takes several minutes."
+    unzip -p "$ZIPFILE" rootfs.img | \
+        dd of="$DATA_TARGET" bs=4M || abort "failed to write the root filesystem"
+    sync
+
+    # Read back what the tablet now holds instead of trusting that dd is
+    # enough: a truncated ZIP stream, a full partition or a silent I/O error
+    # all end with dd reporting success and a system that will not boot.
+    ui_print "Verifying the written root filesystem..."
+    WRITTEN_SHA="$(dd if="$DATA_TARGET" bs=1M count="$ROOTFS_MIB" 2>/dev/null | \
+        sha256sum | cut -d' ' -f1)"
+    [ "$WRITTEN_SHA" = "$ROOTFS_SHA" ] || \
+        abort "the root filesystem read back differently from the image"
+    [ "$(fs_label "$DATA_TARGET")" = "$ROOTFS_LABEL" ] || \
+        abort "$ROOT_PART does not read back as $ROOTFS_LABEL"
+fi
+
+# ---------------------------------------------------------------------------
+# The way back to Android, saved while it is still there
+# ---------------------------------------------------------------------------
+#
+# The four boot partitions still hold Android's images at this point, and in a
+# few lines they will not.  This is the only moment in the whole procedure when
+# both systems' boot images exist somewhere at once, so it is where the sets
+# the dual-boot switchers read are seeded.
+#
+# None of this is allowed to fail the installation.  A tablet with Debian on it
+# and no saved Android set is inconvenient; a tablet with a half-written boot
+# partition is bricked until the next flash.
+
+if [ "$HAS_ROOTFS_IMAGE" -eq 1 ] && [ "$ROOT_PART" = linuxroot ]; then
+    seed_boot_sets
+fi
+
+for part in boot init_boot vendor_boot dtbo; do
+    target="$(resolve_part "$part")" || abort "partition disappeared: $part"
+    ui_print "Writing $part..."
+    unzip -p "$ZIPFILE" "$part.img" | \
+        dd of="$target" bs=4M || abort "failed to write $part"
+done
+
+if [ "$SKIP_VBMETA" -eq 0 ]; then
+    unzip -p "$ZIPFILE" vbmeta.img | \
+        dd of="$VBMETA_TARGET" bs=4M || abort "failed to write vbmeta"
+fi
+
+if [ "$HAS_ROOTFS_OVERLAY" -eq 1 ]; then
+    ui_print "Installing the versioned rootfs overlay..."
+    # The ZIP's own POSIX bits are not applied by `unzip -p`, so the manifest
+    # carries the mode explicitly and it is set after extraction.
+    unzip -p "$ZIPFILE" ROOTFS-OVERLAY-SHA256SUMS | \
+    while read expected mode relative; do
+        [ -n "$expected" ] || continue
+        case "$mode" in
+            0644|0755) ;;
+            *) abort "unsafe rootfs overlay mode: $mode" ;;
+        esac
+        case "$relative" in
+            /*|../*|*/../*) abort "unsafe rootfs overlay path: $relative" ;;
+        esac
+        target="$ROOTFS_MOUNT/$relative"
+        mkdir -p "${target%/*}" || abort "cannot create directory for $relative"
+        chmod 0755 "${target%/*}" || abort "cannot secure directory for $relative"
+        unzip -p "$ZIPFILE" "rootfs-overlay/$relative" > "$target" || \
+            abort "cannot extract rootfs overlay file $relative"
+        chmod "$mode" "$target" || abort "cannot set mode on $relative"
+        actual="$(sha256sum "$target" | cut -d' ' -f1)"
+        [ "$actual" = "$expected" ] || abort "rootfs overlay hash mismatch: $relative"
+    done
+    [ "$?" -eq 0 ] || abort "rootfs overlay installation failed"
+
+    # systemd ignores a regular file inside a .wants directory: activation has
+    # to be a real symlink, so it is created here from a packaged manifest.
+    if zip_has ROOTFS-OVERLAY-ENABLE; then
+        unzip -p "$ZIPFILE" ROOTFS-OVERLAY-ENABLE | \
+        while read target_unit unit; do
+            [ -n "$unit" ] || continue
+            case "$target_unit$unit" in
+                */*|*..*) abort "unsafe unit activation: $target_unit $unit" ;;
+            esac
+            unit_path="$ROOTFS_MOUNT/usr/lib/systemd/system/$unit"
+            [ -f "$unit_path" ] || abort "unit missing from the overlay: $unit"
+            wants="$ROOTFS_MOUNT/usr/lib/systemd/system/$target_unit.wants"
+            mkdir -p "$wants" || abort "cannot create $target_unit.wants"
+            rm -f "$wants/$unit"
+            ln -s "../$unit" "$wants/$unit" || abort "cannot enable $unit"
+        done
+        [ "$?" -eq 0 ] || abort "unit activation failed"
+    fi
+
+    sync
+    umount "$ROOTFS_MOUNT" || abort "cannot unmount the Debian root filesystem"
+    ROOTFS_MOUNTED=0
+    ui_print "Rootfs overlay installed and verified."
+fi
+
+sync
+ui_print "---------------------------------------"
+ui_print " Images written."
+if [ "$HAS_ROOTFS_IMAGE" -eq 1 ]; then
+    ui_print " Debian is installed on the internal storage."
+    ui_print " The root filesystem grows to the whole"
+    ui_print " partition on the first boot."
+fi
+ui_print "---------------------------------------"
+exit 0

@@ -1,0 +1,2523 @@
+# The EL721 fingerprint reader under Ubuntu
+
+## Current status: working, owner-confirmed
+
+On 2026-09-03 the owner accepted the Galaxy Tab S9 Ultra Wi-Fi's (`SM-X910`)
+EL721 under-display fingerprint feature as functionally complete and requested
+its merge into main. The hardware status is **✅ working**, replacing earlier
+partial-completion estimates.
+
+Physically confirmed on the tablet:
+
+- Encrypted enrollment, deletion and re-enrollment through Ubuntu Settings and
+  Tab Companion, using the same fprintd store throughout.
+- Repeated acceptance of enrolled fingers and rejection of other fingers;
+  Companion's single held-touch test identifies and highlights the matched
+  saved finger.
+- GDM login before a session starts and GNOME screen unlock, with password
+  fallback, automatic password keyboard and portrait keyboard-overlap handling.
+- Waiting fingerprint icon and illumination on contact, correctly aligned to
+  the physical sensor across display rotations.
+- Automatic secure startup after a full Ubuntu reboot, and successful use of
+  both saved fingerprints after reboot and suspend/resume.
+
+Tab Companion 1.2.2 includes the [fingerprint settings page](tab-companion.md#fingerprint-settings-121).
+The matched [fprintd/PAM package pair](../packaging/fprintd/README.md) also passes
+APT dependency checks; future image builds include and validate both packages.
+This status describes the current implementation, not a newly published
+installation ZIP or a security certification. Only two physical fingers have
+been validated as a multi-print gallery; the ten-name capacity is software-tested.
+
+Maintenance constraints remain: the SPU listener/DMA owner is a persistent
+boot-only service and must not be stopped or restarted in place while secure
+world can retain its DMA buffer. Recovery of that owner requires an Ubuntu
+reboot. The [multiple-fingerprint latency report](fingerprint-gallery-performance.md)
+documents the current independent-gallery cost and optional future optimization;
+it is not a remaining functional blocker.
+
+The detailed checkpoints below preserve the investigation history. This status
+supersedes their earlier encryption failures, pending tests and percentage
+estimates; see also the [automatic-startup checkpoint](#automatic-secure-startup-first-ubuntu-boot-2026-09-03).
+
+### Original desktop follow-up checklist (completed)
+
+The following records the original desktop requirements, now covered by the
+owner-confirmed integration above; it is not a list of remaining work.
+
+GNOME Settings 46.7 already handles `EnrollStatus`: progress, accepted-stage
+animation, retry instructions and errors. The current console-driven probes
+do not open that dialog, and the target overlay is not an enrolment wizard.
+The native dialog remains supported alongside Companion's settings. GNOME Shell's
+authentication prompt also supports feedback from GDM; placement near this
+physical under-display sensor still requires device-specific integration.
+
+The requested integration was:
+
+1. Show a dim fingerprint icon while waiting; illuminate the optical target
+   only during actual contact/capture, then restore brightness on release,
+   completion, cancellation or failure.
+2. Anchor the target to the physical sensor using the monitor's **applied
+   transform**, not raw accelerometer orientation. Turning a rotation-locked
+   tablet must not move the target away from the sensor.
+3. Validate both screen unlock and GDM login. Keep the physical target fixed
+   but orient any nearby failure text with the displayed UI.
+4. Avoid overlap with the on-screen password keyboard, especially in portrait.
+   If the keyboard covers the sensor, suppress the target rather than move it
+   to a non-sensing location or consume password keystrokes. Password entry
+   must remain usable throughout.
+
+References: [GNOME 46.7 enrol dialog](https://github.com/GNOME/gnome-control-center/blob/46.7/panels/system/users/cc-fingerprint-dialog.c#L639),
+[GNOME 46 authentication prompt](https://github.com/GNOME/gnome-shell/blob/46.0/js/gdm/authPrompt.js).
+
+## Confirmed identification
+
+- Sensor: EgisTec EL721, identified by the R03 overlay and Samsung's official
+  GPL driver for the `el7xx` family.
+- Type: optical reader under the AMOLED panel.
+- 3.3 V supply: PMIC-B LDO2 (`VDD_BTP_3P3` / `vreg_l2b_3p3`). The stock
+  X910 node has no `etspi-ldoPin`; GPIO91 is a legacy port assumption, not the
+  reader's supply.
+- Enable/reset: TLMM GPIO155 (`etspi-sleepPin`).
+- Model reported by Samsung: `X916`.
+- Stock position:
+  `16.70,0.00,9.10,9.10,14.80,14.80,12.00,12.00,5.00`.
+
+The sensor works in secure mode. Samsung's Linux driver contains neither the
+recognition algorithm nor a normal path to obtain images: enrolment, matching
+and templates are delegated to signed applications inside TrustZone.
+
+The official firmware's chain is precisely identified:
+
+```text
+fingerprint-service
+  → libsfp_sensor
+  → libsfp_teegw
+  → libQSEEComAPI (objects)
+  → compatible AppLoader, UID 122
+  → lookupTA("dualfp") → 23 (not loaded)
+  → signed dualfp TA from /vendor/firmware_mnt/image
+  → QSEEComCompat controller → BAUTH
+```
+
+No `securefp.mbn` file exists in `system`, `vendor`, `odm` or the biometric
+APEX. Static analysis had shown that Samsung's gateway can use either
+`securefp` or `dualfp`, but a traced One UI 8 service restart settled the live
+path: it asks for `dualfp`, receives AppLoader result `23`, and loads the split
+image explicitly. Both the mounted fingerprint APEX and its active update
+directory are empty of TAs. A full analysis of `NON-HLOS.bin` resolved the
+remaining ambiguity: `fingerpr.b00`–`b08` holds the generic QFP engine, while
+`dualfp.b00`–`b08` holds the Samsung/Egis implementation of the EL721, BAUTH,
+matching and templates. Preloading `authnr.mbn`, another authenticator that
+references both names, did not alter Ubuntu's result.
+
+The assembled `dualfp` image is 19,927,128 bytes. The compatible AppLoader UID
+122 accepts it with `loadFromRegion` and returns a valid QSEEComCompat handle;
+the subsequent unload also completes correctly. That proves the required secure
+TA is present and executable from Ubuntu. A root client registered by the
+upstream `quic-teec` helper does not find a preloaded object and therefore
+loads the signed image explicitly, just as the measured One UI path does.
+
+### One UI 8 as the live reference
+
+The rooted Android 16 / One UI 8 build `X910XXS5DZA1` was measured without
+reading or copying any enrolled template. Its public kernel interfaces report
+`EGISTEC`, `EL721`, type `8`, a 20 MHz secure SPI clock and product ID
+`EL721-B`. The fingerprint service is the AIDL v2
+`vendor.samsung.hardware.biometrics.fingerprint-service`, runs as Android's
+`system` UID 1000, opens `/dev/esfp0` and talks through `/dev/smcinvoke`.
+
+A system-wide `smcinvoke` trace of a clean service start and a real fingerprint
+unlock settles the important transport details:
+
+- the service calls `lookupTA("dualfp")`, gets result `23`, allocates the TA
+  image from `qcom,qseecom-ta` and opens a session successfully;
+- its two persistent BAUTH buffers are `0x2a4000` bytes each and come from the
+  CMA-backed `qcom,qseecom` dma-heap;
+- the SHM bridges expose the rounded TA at physical `0xf5400000` with size
+  `0x1302000`, and the BAUTH buffers at `0xfc300000` and `0xfc600000`; all
+  three use HLOS VMID 3 and read/write permission 6;
+- BAUTH requests use controller operation 0 with counts `0x0424` — four input
+  buffers, two output buffers and four input objects — exactly the layout
+  emitted by the Ubuntu probe;
+- the real unlock trace recorded 3,839 samples with none lost; every one of the
+  fingerprint service's observed controller calls completed with result zero.
+
+A later service restart exposed an important distinction. Samsung's
+`fingerprint.ko` initialises its cached sensor type to `-1` at a cold probe, but
+the running One UI instance had already cached `8` in the driver. The service
+therefore logged `already sensor_type checked`, skipped command `16`
+(`TypeCheck`) and made command `1` (`Prepare`) its first real TA operation.
+`libsfp_sensor` maps the EL721 name enum `21` to type `8`; this mapping is fixed
+for the soldered X910 hardware and is not a user-selected value.
+
+The current `dualfp` image is still 19,927,128 bytes and its code still opens
+QUP1_SE2 at 20 MHz, maps input sensor-name enum `21` (`EL721`) to output type
+`8`, and uses the same TypeCheck command and shared-buffer sizes. There is no
+protocol drift caused by One UI 8 or by the dual-boot changes.
+
+One UI reports its active FOD rectangle as `854,2689,993,2829`. Ubuntu's
+slightly different `[854,2732]–[994,2872]` rectangle remains the one physically
+validated against the Goodix raw coordinate stream; the stock value is a
+reference to reconcile when rotation and the final GNOME overlay are wired up,
+not a reason to change the working touch exclusion blindly.
+
+The official image also contains Samsung's biometric service and the Egis
+libraries, but they depend on Bionic, Binder, Android's biometric AIDL and
+Gatekeeper tokens. That is why they are not a directly interchangeable backend
+for `fprintd`.
+
+## The prepared architecture
+
+The infrastructure is deliberately **opt-in**. A normal build uses exactly the
+DT and panel driver of the last validated commit, does not apply the Goodix FOD
+extension and does not compile the EL721. QCOMTEE keeps the base's modular
+configuration but stays blacklisted. For a controlled test, the combined
+selector `ENABLE_FINGERPRINT_EXPERIMENTAL=1` can be used, or
+`FINGERPRINT_PANEL_FOD`, `FINGERPRINT_TOUCH_FOD` and `FINGERPRINT_EL721`
+enabled separately. The signed QCOMTEE module only loads with `modprobe
+qcomtee`, after booting and enabling logging. This separation was introduced
+after observing a reboot before the root filesystem was mounted, and it stops
+another failure from becoming a bootloop.
+
+The implementation separates four responsibilities:
+
+1. `egis_el721.c` controls only the 3.3 V rail and the enable/reset line. It
+   publishes `/dev/esfp0` for the non-sensitive part of the Egis ABI; it does
+   not register the sensor as an SPI peripheral reachable from Linux.
+2. `CONFIG_TEE=y` keeps the common infrastructure. In experimental builds,
+   `CONFIG_QCOMTEE=m` packages Qualcomm's QTEE object transport; loading it
+   manually publishes `/dev/tee0`. The Qualcomm Diagnostics transport and the
+   UID 122 AppLoader are physically validated. Messages keep the upstream 4 MiB
+   limit; larger TAs are delivered with a TEE memory object through
+   `loadFromRegion`, without inflating the message or duplicating 20 MiB in
+   CMA.
+3. `panel-samsung-ana38407.c` offers the high-brightness mode an optical reader
+   requires. It preserves the brightness GNOME asked for, restores it at the
+   end, and forces cleanup after 15 seconds. A GNOME extension draws the target
+   and compensates the global HBM outside that region.
+4. The Goodix driver suppresses fingers only inside the sensor's rectangle and
+   only during a biometric operation. The firmware already delivers real FOD
+   `press/release` events and does not forward that contact as a normal touch.
+   The rest of the screen stays usable, and disabling the session releases any
+   held contacts. The session is also cancelled, rather than restored, when the
+   system suspends.
+
+GNOME 46 and `fprintd` do not themselves know a UDFPS's geometry and do not
+control the panel's HBM. The `gts9u-fingerprint-overlay@agcarbajo` system
+extension covers that gap in the session and at unlock; it still has to be
+wired to the backend and loaded in GDM too.
+
+## Security boundaries
+
+These boundaries are part of the design, not optional tasks:
+
+- Linux must not expose the EL721's frames, registers or raw SPI transactions.
+  Unknown `/dev/esfp0` operations fail with `EOPNOTSUPP`.
+- `/dev/esfp0` is created mode `0600`; its `ioctl`s require `CAP_SYS_ADMIN`.
+  The sensor starts powered off and is powered off on suspend, on driver removal
+  and at shutdown.
+- Templates and matching must stay in QTEE. The port neither imports, exports
+  nor reuses the fingerprints enrolled under Android.
+- The legacy QSEECOM machine list is not modified. The chosen route is the
+  modern QTEE transport that already exists in the pinned kernel.
+- Touch exclusion must be limited to the sensor's rectangle and only during an
+  active operation. Grabbing the whole device with `EVIOCGRAB` would block the
+  lock screen and is not acceptable.
+- Every exit, cancellation, error, suspend or client shutdown must run the
+  reverse sequence: remove the circle, leave HBM, power the sensor down and
+  re-enable touches. The panel's watchdog is a second line of defence, not the
+  normal way to close.
+
+## Kernel interfaces
+
+The paths contain dynamically assigned names; the device has to be discovered
+rather than its index hardcoded.
+
+### The EL721 sensor
+
+The character node is fixed:
+
+```text
+/dev/esfp0
+```
+
+The platform device exposes these attributes:
+
+| Attribute | Access | Contents |
+|---|---|---|
+| `vendor` | read | `EGISTEC` |
+| `name` | read | `EL721` |
+| `model` | read | `X916` |
+| `position` | read | geometric metadata from the stock overlay |
+| `type_check` | read | fixed/cached Samsung sensor type (`8` for EL721) |
+| `sensor_power` | read/write | state and control of GPIO91/GPIO155 |
+| `reset` | write | controlled reset; accepts only `1` |
+| `reset_count` | read | resets performed since boot |
+
+They can be located without assuming the device's name:
+
+```sh
+find /sys/bus/platform/devices -type f -name vendor -exec grep -l EGISTEC {} +
+```
+
+### The ANA38407 panel
+
+The attributes appear next to the ANA38407 backlight:
+
+| Attribute | Access | Contents |
+|---|---|---|
+| `fod_ready` | read | `1` when the panel is ready and on |
+| `fod_mode` | read/write | optical HBM and the FlatZ sequence |
+| `fod_brightness` | read | raw optical WRDISBV setting, 1623; not measured luminance |
+| `fod_circle` | read/write | a diagnostic DDIC command; requires `fod_mode=1`, but draws nothing without Self Display |
+| `cell_id` | read | the panel's 22-character module identifier, or `ENODATA` |
+
+`cell_id` exists because Samsung's fingerprint TA binds the optical
+calibration to the panel it was measured on. The driver reads `RX_MODULE_INFO`
+(DCS `0xa1`, eleven bytes under the level-0 key) while the panel is coming up
+and publishes it in Android's byte order: bytes 4..10 followed by 0..3, as
+lowercase hexadecimal. It is read once per power-on, never written, and the
+attribute fails with `ENODATA` rather than inventing a value if the DDIC does
+not answer.
+
+The panel keeps the desktop's requested brightness in parallel. Writing
+`fod_mode=0` restores that value, and also switches the circle off if it was
+active. The watchdog returns both controls to zero after 15 seconds.
+
+This layer has already run in isolation on hardware. HBM, the watchdog and the
+exact brightness restoration were validated. `fod_circle=1` reaches the DDIC
+without error but produces no visible image: the Samsung kernel first loads a
+Self Display image and checks its checksum. Porting that subsystem just for the
+indicator gains no capture; GNOME's target is used instead. The panel on its
+own is ruled out as the cause of the initial bootloop.
+
+The ANA38407 offers no local HBM. Reading a fingerprint puts it into global
+FlatZ/HBM and GNOME darkens the pixels outside the target. Being OLED, those
+pixels physically emit less light even though the region is selected in the
+compositor. The opacity is computed from the current brightness with the
+official table: normal mode reaches 420 cd/m² at `WRDISBV=2047`, and
+fingerprint HBM uses level 385 / WRDISBV 1623, approximately 634 cd/m². The
+previous driver erroneously used 2047, which maps to 900 cd/m² in HBM. The
+target is left out of the compensation; the rest keeps roughly its previous
+luminance. These are Samsung table values, not photometer measurements.
+The extension recalculates every 100 ms in case a key changes the brightness
+during the read.
+
+### Goodix touch
+
+The UDFPS block is configured on the Goodix I²C device through four sysfs
+attributes:
+
+| Attribute | Access | Contents |
+|---|---|---|
+| `fod_rect` | root read/write | `left top right bottom` in raw Goodix coordinates |
+| `fod_enable` | root read/write | enables the FOD sponge and the regional suppression |
+| `fod_property` | root read/write | Samsung's `fast/strict` policy, values `0`–`3`; default `3` |
+| `fod_state` | read, pollable | `idle|pressed|released|out|vi x y sequence` |
+
+The driver obtains the sponge's address from the SEC extension the GT6936
+firmware publishes; it hardcodes no controller registers. On the physical unit
+it announces `0x29800`, length 1024. The SEC structure starts after
+`IC_INFO`'s ten trailing reserved bytes; skipping them yields a false address.
+Like Samsung's driver, every access first wakes the firmware into normal mode
+with command `0x9f` and then confirms the sponge with `0xf2`.
+
+The raw rectangle `[854,2732]–[994,2872]` was physically validated: a finger at
+the visual centre produced `released 911 2808` and `released 945 2809`. During
+that same test no `BTN_TOUCH`, tracking ID or normal coordinate appeared. Each
+slot is classified when it starts: a finger begun inside is consumed until
+`UP`, while one begun outside keeps working even as it crosses the rectangle.
+
+## The intended sequence for a read
+
+The future `fprintd` backend must treat every read as a transaction:
+
+1. check the panel, QTEE and the sensor;
+2. transform the geometry to the current orientation and enable the Goodix
+   exclusion for that area only;
+3. power the EL721 up and, if needed, reset it;
+4. show GNOME's mask/target and enable `fod_mode`;
+5. ask `dualfp` for the capture or match through QTEE;
+6. in an unconditional cleanup block, remove the circle and HBM, power the
+   sensor down and re-enable touch.
+
+The sensor, the circle and HBM must not be kept active between samples for
+longer than the secure application asks.
+
+## Layered validation
+
+### 1. Non-destructive probing
+
+After booting an experimental build, first confirm QTEE is still unloaded and
+load it only with a recovery channel available:
+
+```sh
+test ! -e /dev/tee0
+lsmod | grep -q '^qcomtee ' && exit 1
+sudo modprobe qcomtee
+```
+
+Then:
+
+```sh
+test -c /dev/esfp0
+test -c /dev/tee0
+fp_vendor=$(grep -l '^EGISTEC$' /sys/bus/platform/devices/*/vendor | head -n1)
+test -n "$fp_vendor"
+fp_sysfs=${fp_vendor%/vendor}
+for attr in vendor name model position sensor_power; do
+	printf '%s: ' "$attr"
+	cat "$fp_sysfs/$attr"
+done
+dmesg | grep -Ei 'egis|el721|qcomtee|fingerprint'
+```
+
+The expected result before starting an operation is `sensor_power=0`. The mere
+existence of these nodes validates infrastructure only; it does not prove a
+fingerprint can be enrolled or recognised.
+
+### 2. Power and reset
+
+The test runs as `root`, must be brief, and ends by powering the sensor down
+even if a command fails:
+
+```sh
+fp_vendor=$(grep -l '^EGISTEC$' /sys/bus/platform/devices/*/vendor | head -n1)
+test -n "$fp_vendor"
+fp_sysfs=${fp_vendor%/vendor}
+trap 'printf 0 > "$fp_sysfs/sensor_power"' EXIT
+printf 1 > "$fp_sysfs/sensor_power"
+cat "$fp_sysfs/sensor_power"
+printf 1 > "$fp_sysfs/reset"
+cat "$fp_sysfs/reset_count"
+```
+
+It must also be verified that the rail returns to zero after a reboot, a
+shutdown, or forcing the driver's removal.
+
+### 3. The optical panel
+
+Tested only as `root` and with the screen on. The change must be observed for a
+few seconds, never leaving HBM latched:
+
+```sh
+bl=$(for d in /sys/class/backlight/*; do
+	test -e "$d/fod_ready" && { printf '%s\n' "$d"; break; }
+done)
+test -n "$bl"
+test "$(cat "$bl/fod_ready")" = 1
+trap 'printf 0 > "$bl/fod_mode"' EXIT
+printf 1 > "$bl/fod_mode"
+sleep 2
+printf 0 > "$bl/fod_mode"
+```
+
+The validation must confirm that the previous brightness returns, that
+suspending or powering off cleans the state, and that the watchdog acts if the
+client dies.
+
+### 4. Touch exclusion
+
+Validated on 14 August 2026 on the physical tablet. With `fod_property=3`, the
+GT6936 delivered `released` inside the rectangle and a simultaneous listen on
+`/dev/input/event5` received no normal contact. Disabling the session made the
+screen respond immediately. What remains is repeating the full authentication
+experience in GDM and in all four orientations, once the backend exists.
+
+### 5. QTEE and full authentication
+
+The read-only query with the official `quic-teec` tools already confirms QTEE
+5.2.0, Qualcomm Diagnostics and the compatible UID 122 AppLoader. Ubuntu gets
+result `2` from `lookupTA("securefp")` as root and after reproducing Android's
+numeric UID 1000. The live One UI 8 service does not use that alias either: it
+gets `23` from `lookupTA("dualfp")` and loads the signed image. Client identity
+and a supposedly hidden preloaded controller are therefore ruled out.
+
+`scripts/probe-qtee-securefp.c` implements exactly that query. It is built
+against `quic-teec` `736419e25a2036aac3292a10a93e394a90750ca3` and QCBOR
+`4ace4620d549f22c1163c5b00d3ae0c0dae1d207`: it opens UID 122, runs only
+`lookupTA("securefp")` and releases the returned handle without obtaining the
+application object or sending it an operation. Its optional
+`--client-uid=UID` opens `/dev/tee0` first and then irreversibly removes the
+process's groups, UID and GID before `registerAsClient`; it cannot regain root.
+This reproduced Samsung's numeric UID 1000 credential without loosening
+`/dev/tee0` permissions and gave the same negative result as UID 0.
+
+`scripts/probe-qtee-load-securefp.c` reassembles a stock split image with the
+ELF offsets Qualcomm uses. It takes the segments' base name and the load name
+separately. For `dualfp` it reserves a TEE memory object and uses
+`loadFromRegion`; QTEE accepted the 19,927,128 bytes as `dualfp` and unloaded
+them cleanly. The probe also offers `--type-check[=FIRST[-LAST]]`: the request
+reaches the TA (`invoke result 0`). The stock HAL identifies `EL721` with name
+enum `21` and translates it to sensor type `8`; the probe reproduces that exact
+mapping. Its mutually exclusive `--prepare` selector sends the stock command
+`1` in no-calibration mode and reports only result fields and returned byte
+counts. Neither selector starts capture, enrolment or matching.
+
+Qualcomm's pinned credential callback serialises `getuid()` and the current
+time into the CBOR object passed to `IClientEnv.registerAsClient`. The probes
+also expose a diagnostic `--kernel-client-env` path: with a narrowly gated
+kernel patch it reproduces downstream smcinvoke's root operation 5 with a NULL
+credentials object. That exact path also loads `dualfp` but TypeCheck remains
+at type zero. The patch is disabled in normal and release builds. These are
+controlled hypothesis tests, not a service design: a production backend will
+run under a dedicated unprivileged identity with narrowly granted device
+access.
+
+For three sessions the TA answered `29` to everything. The cause was resolved
+on 14 August 2026 by disassembling the TA itself, which is not encrypted. Its
+dispatcher rejects the request and writes `29` into `rsp[4]` when the prior
+validation of the embedded pointers fails, and that validation consists of
+**registering each of them again as a shared buffer of `0x2a4000` bytes**:
+
+```text
+4280:  bl   0x1b0                 ; qsee_register_shared_buffer(ptr, 0x2a4000)
+42b4:  cbz  w0, ok
+42b8:  log  "FAIL_REGISTER_SB(%d)"
+42dc:  mov  w0, #0x1d             ; 29
+```
+
+The stock gateway declares 8 bytes of payload, but its `dmabuf` allocations are
+much larger, so the registration works for it. Reserving both TEE memory
+objects at that exact size makes the TA accept the request and run the command:
+`invoke result 0`, `trustlet=0`, response envelope zeroed. `29` simply meant
+the buffers were too small.
+
+With the transport correct, the standalone `TypeCheck` diagnostic still
+returns type `0`. That command performs up to three SPI transfers and requires
+reading `rx[42]==0x07` and `rx[46]==21` to declare `ET721`. It was initially
+treated as the blocking result. The live service restart showed that it is not
+part of the steady-state path once the platform driver already knows its one
+soldered sensor, so Ubuntu now also publishes the fixed type `8` instead of
+making normal operation depend on this cold-discovery helper.
+
+The decisive follow-up reproduces `BAuth_Prepare` instead. Samsung uses a
+`0x80010`-byte wire view over each persistent `0x2a4000` shared buffer. With no
+Ubuntu calibration file, the input is command `1`, mode `2`, zero calibration
+bytes. On the physical tablet on 22 August 2026, the signed TA answered:
+
+```text
+Prepare: invoke result 0; trustlet=0, payload=0,
+         sensor_type=8, function_status=0, calibration_bytes=0
+```
+
+This is the first successful secure EL721 initialisation from Ubuntu. It also
+proves that QUP1_SE2 ownership and the trusted sensor path work; the earlier
+`TypeCheck=0` result is a limitation of that discovery command in this boot
+context, not evidence that the TA cannot communicate with the sensor. The
+one-shot cleanup then measured `sensor_power=0`, removed `/dev/tee0` and
+unloaded QCOMTEE.
+
+The bus is **QUP1_SE2**, and its pins are worth pinning down properly because
+an earlier measurement was made on the wrong ones. The TA names its pads
+`qup1_se2_l0..l3`, and `qup1_se2` is **gpio36–gpio39**, not gpio64–67 — those
+are `qup2_se2`. The numbering agrees between the stock tree and mainline:
+gpio26 is `qup1_se7` in both.
+
+Those pins are **out of Linux's reach by design**, here and in stock: this port
+declares `gpio-reserved-ranges = <36 4>` and the stock tree
+`qcom,gpios-reserved = <0x20 … 0x27>`, precisely because TrustZone governs
+them. The kernel does not expose them, so no sampling from user space can
+observe them, and **there is no valid measurement of whether TrustZone drives
+that bus or not**. The one published earlier looked at gpio64–67 and proves
+nothing.
+
+The rest of the Linux layer already mirrors stock exactly, which was checked
+one item at a time: the `spi@a88000` node (`qupv3_se2_spi`) is disabled in the
+stock tree too and the X910's overlay never references it; Samsung's driver in
+a secure build is a `platform_driver` hanging off `soc`; and the SE's clocks
+come up disabled from the bootloader, Linux does not disable them — the command
+line already carries `clk_ignore_unused`, `pd_ignore_unused` and
+`regulator_ignore_unused`. Holding `gcc_qupv3_wrap1_s2_clk` on from a module
+does not change the result.
+
+TrustZone's generic log is not a usable diagnostic path on this firmware. The
+stock tree describes `tz-log@146AA720`, but that window contains pointers into
+secure memory; reading Android's generic `/proc/tzdbg/log` rebooted the tablet.
+It must not be probed again. The classic SIP call (service 6, command 2)
+answers "not supported", and QTEE's Diagnostics service (UID 143) only returns
+the list of loaded TAs. This no longer blocks the port because `Prepare`
+provides a successful end-to-end sensor result.
+
+It was verified that the tablet's active partitions match the analysed firmware
+byte for byte: `apnhlos` matches `NON-HLOS.bin` (SHA-256 `1aa9de73…`) and `tz`
+matches `tz.mbn` (`865b32e1…`). The result is not down to mixed versions or to
+anti-rollback.
+
+The helper tools live in `scripts/` and are not installed in the final image:
+`probe-el721-abi.c` checks that the restricted ABI exposes only the model,
+`probe-qtee-securefp.c` queries a logical name, and `probe-qtee-load-ta.c`
+allows loading and unloading a small, already-assembled TA.
+`probe-qtee-load-securefp.c` contains the bounded EL721 `TypeCheck` and
+`Prepare` calls, while `probe-stock-qseecom.c` keeps the equivalent experiment
+for linking against the stock Bionic library. None of them enrols templates or
+is used as an authentication backend.
+
+`fprintd` is now present in the image, but nothing can be enrolled through it
+yet and the reader is not advertised as working. These have to be validated, in
+this order, before that changes:
+
+- enrolment and cancellation without leaving HBM, the sensor or the touch block
+  active;
+- several correct verifications and wrong fingers;
+- unlocking GNOME and authenticating in GDM;
+- suspend/resume, rotation and brightness changes during a read;
+- a reboot with no loss and no exposure of templates;
+- recovery after the backend crashes and after the watchdog expires.
+
+Until that whole matrix passes, the public status stays experimental and
+fingerprint authentication is considered unavailable.
+
+## The userspace backend
+
+With `Prepare` working, the probes stopped being the right shape for the job
+and the backend was written properly. It lives in `packaging/libfprint/` and is
+built into a replacement `libfprint-2-2` package by
+`scripts/build-libfprint-el721.sh`; the Noble package it replaces keeps its ABI
+version, so the device package pins the local build explicitly.
+
+`el721-qtee.c` is the QTEE side. It owns the whole secure transaction: it opens
+`/dev/tee0`, registers as a client, assembles and loads the signed `dualfp`
+image, keeps the two `0x2a4000` shared buffers alive for the session, serves
+the QIS callback listener the TA registers, and exposes Samsung's BAUTH command
+set as ordinary C functions — `Prepare`, the generic control command `12`, the
+active-group key, and the `EnrollInit`/`Do`/`Final`,
+`IdentifyInit`/`Do`/`Final` and `Cancel` pairs. Three details were measured on
+the tablet rather than guessed: the calibrated `Prepare` is retried through the
+same opcode transitions One UI uses, where opcode `8` means reset the sensor
+and opcode `9` is acknowledged with control opcode `83` instead of a power
+cycle; the two bootstrap controls are advisory, and operation `76` answers
+status `51` on this tablet while startup continues; and the optical
+`egoptbds.dat` blob is uploaded in chunks through the control command rather
+than in one message.
+
+The calibration inputs are proprietary and stay out of the repository.
+`scripts/import-fingerprint-firmware.sh` packages them from a directory the
+tablet's owner extracts from their own matching firmware, checking each file
+against a pinned hash: the nine `dualfp` segments, `calib.dat` and
+`egoptbds.dat`. The panel's `cell_id` completes that set from the running
+hardware.
+
+`el721.c` is the `libfprint` driver on top. `libfprint` has no bus that can see
+a platform device, so `patches/0001-el721-platform-driver.patch` adds the
+enumeration path; the driver itself powers the rail, runs `Prepare`, raises the
+panel's HBM for the duration of the operation, follows the finger through the
+Goodix FOD state, drives the enrol and identify loops, converts the TA's opaque
+template blob into an `FpPrint`, and unwinds power, HBM and touch suppression
+on every exit — including cancellation and timeout. Templates are stored by
+`fprintd` as the TA emitted them; Linux never parses them and never touches
+Android's enrolled data.
+
+The lifecycle around it is packaged too. `ubuntu-gts9u-qcomtee.service` loads
+the QCOMTEE module before `fprintd`, a drop-in grants `fprintd` the single
+extra device it needs (`/dev/tee0` read/write, leaving the rest of the stock
+sandbox intact), and `ubuntu-gts9u-fingerprint-cleanup` returns HBM, the touch
+block and the sensor rail to zero if `fprintd` dies or is upgraded mid-read.
+
+## What 29 and 51 actually mean
+
+Two status codes drove most of the guesswork, and disassembling the TA's own
+dispatcher settled both. The command table is a jump table of nineteen
+entries, and every handler starts by checking the exact wire sizes of the
+request and the response:
+
+| Command | Input | Output |
+|---|---|---|
+| 1 `Prepare` | `0x80010` | `0x80010` |
+| 2 `EnrollInit` | `0x178` | `0xc` |
+| 8 | `0x510` | `0x40c` |
+| 9 | `0x914` | `8` |
+| 10 `Cancel` | `8` | `8` |
+| 12 `Control` | `0x2a3110` | `0x2a3010` |
+| 13 `HatOp` | `0x48d` | `0x40c` |
+
+**51 is a size mismatch.** A handler that does not recognise the declared
+lengths logs `invalid length` and answers 51; every control operation that
+answered 51 was answering that, not refusing the operation.
+
+**29 has two different sources.** The dispatcher registers both non-secure
+pointers with `qsee_register_shared_buffer` before it dispatches, and writes
+29 if that fails — this is the historical meaning, and it is satisfied. The
+enrolment path returns the same number for an unrelated reason:
+`init_enroll_stub` calls into Samsung's `tz_vigis_api.c`, which returns `0x1d`
+when the optical engine's global context is still NULL. The context is created
+by `prepare_stub`, and Ubuntu's `Prepare` returns all zeros without creating
+it, because it is missing the optical data One UI loads first.
+
+The kernel side of the old theory was still worth fixing and is in tree.
+`qcomtee-bridge-large-objects.patch` gives every memory object in the BAUTH
+size range its own contiguous DMA32 allocation and its own SHM bridge, instead
+of a suballocation inside a larger bridged TZMEM area; the threshold matters,
+because 2.76 MB fell under `SZ_4M` and silently took the page-backed path.
+
+## The current state and the next step
+
+Everything above the secure boundary is written; nothing above it is proven.
+The last measured milestone is still the calibrated `Prepare`. The enrol chain
+— generating the active-group key, `EnrollInit`, the `EnrollDo` loop with a
+real finger under HBM, and an `EnrollFinal` that returns a template — has been
+exercised repeatedly against the TA but has never been carried through to a
+stored template, and identification has not been attempted at all.
+
+`el721-qtee-selftest.c` is the harness for exactly that step. It powers the
+sensor, opens the session, runs the calibrated `Prepare`, optionally sets the
+active group and issues a single `EnrollInit` followed by `Cancel`, and powers
+the sensor back down whether or not the call succeeded. It records no biometric
+data.
+
+The next milestone is therefore a single successful enrolment, and it is also
+the port's go/no-go point. Booting One UI settled what of the optical bring-up
+is actually missing, and it is less than it looked. `gdxrtcalib.dat` and
+`cbge_*.dat` do not exist anywhere on this tablet: those are Goodix paths that
+the gateway carries for other models, and the Egis EL721 never uses them.
+`/data/vendor/biometrics/meta` holds exactly the two files already imported.
+The panel's `window_type` reads `80 00 04` under One UI, and its `cell_id`
+matches the value the ported ANA38407 driver publishes byte for byte. With
+those bytes supplied, controls 401 and 402 are both accepted.
+
+A traced One UI enrolment then gave the exact sequence the service performs,
+which is worth writing down because it is the specification the Ubuntu backend
+has to meet:
+
+```text
+pre_enroll : control 22 (set_enroll_session, gSession_Flag = 1)
+             command 19 (generate challenge)
+enroll     : control 84 (the gateway logs "skip")
+             register the QIS callback
+             skeymast command 0x203, dualfp command 15, then control 49
+             to install dualfp's HAT HMAC key without exposing it to Linux
+             command 13, the authentication token, right before enrolling
+             command 2  EnrollInit  -> CAPTURE_READY
+             command 3  EnrollDo, repeatedly; opcode 4 is
+                        BAUTH_OP_CODE_WAIT_INTERRUPT with timeout -1, and the
+                        host enables the sensor interrupt and waits
+             on opcode 5: control 87 with one response byte, then control 80
+                          with four response bytes
+             on opcode 87: control 87 with one response byte
+             command 4  EnrollFinal after every capture, then repeat Init
+```
+
+Reproducing that sequence corrected several things in the bridge, all of them
+read out of the TA rather than guessed. Its control command validates a
+response-capacity field the caller writes into the output buffer at
+`0x2a300c`; operation 12 refuses to run with anything under `0x226000` and
+answers 51, which is what that number always means — the declared wire sizes
+are not the ones the handler expects. Operation 48 is
+`BAUTH_OP_CODE_SEND_STOREPATH` and answers 29 until it is given a path.
+Operation 49 is `SEND_KEY`: it consumes the metadata returned by dualfp's
+command 15 after skeymast encapsulates the current HAT key for target
+`"dualfp"` with command `0x203`. Linux relays only the secure-world envelope
+and decoded metadata; the raw HMAC key never enters normal-world memory. The
+optical `egoptbds.dat` goes up in
+`0x3000`-byte pieces with nothing in the scalar field, exactly as One UI's
+`load_bds()` walks it. Operations 401, 402, 84 and 108 land in the TA's
+default case, so 21 simply means this build does not implement them.
+
+The command table itself is now mapped, so no size has to be guessed again:
+
+| Command | Input | Output |
+|---|---|---|
+| 1 Prepare | `0x80010` | `0x80010` |
+| 2 EnrollInit | `0x178` | `0xc` |
+| 3 EnrollDo | `0xc` | `0x230024` |
+| 4 EnrollFinal | `0xc` | `0xa018` |
+| 6 IdentifyDo | `0xc` | `0x230089` |
+| 10 Cancel | `8` | `8` |
+| 13 Hat_OP | `0x48d` | `0x40c` |
+| 19 Challenge | `0xc` | `0x44` |
+
+With every one of those corrections in place, `EnrollInit` still answers 29,
+and so do `EnrollDo` and `IdentifyDo` — with or without a preceding `Prepare`,
+and against a freshly loaded TA. Disassembling that number to its source
+settles what is really wrong, and it is not the transport.
+
+`tz_vigis_api.c` answers 29 when the optical engine's global context is
+missing. That context is created in `fp_prepare_state_handler`, and only after
+`fpsec_open_sensor` succeeds — which first calls `fpsec_spi_open`, which opens
+the secure SPI instance and sets its clock to 20 MHz. When that fails the
+handler logs, skips the allocation and still lets `Prepare` return zero in
+every field the caller can see. So the successful `Prepare` never meant the
+sensor had been opened: it means the command ran, and the sensor type is a
+constant the TA already knows.
+
+That reading was wrong, and the correction matters. `prepare_stub` calls
+`fp_sdk_uninit` first, which is what puts the state global at zero, and
+`fp_prepare_state_handler` propagates any failure back through `Prepare`'s
+result word. Since that word is zero, the sensor does open and the engine
+context is created. The enrolment path returns 29 from the other branch that
+yields the same number: `fp_enroll_init` calls `enroll_init_v2`, the Egis
+matcher's own entry point, and that is what fails.
+
+Two further things were settled by measurement. Holding
+`gcc_qupv3_wrap1_s2_clk` on with its source at 80 MHz changes nothing, so the
+serial engine's clock is not the obstacle. The earlier conclusion that control
+49 decoded a template was wrong: its internal `decode_metadata` call decodes
+the key metadata produced by command 15, then copies the resulting 32-byte key
+into dualfp's HAT verifier. It is a prerequisite for authenticated enrolment.
+
+A traced One UI **cold start** — restarting the stock service with the log
+running — then gave the init sequence, which had been guesswork until now:
+
+```text
+load the TA, then two shared buffers of 0x2a3110 and 0x2a3010 bytes
+command 1   Prepare
+control 76  with room declared for a response
+control 88  (this build answers 51; the stock service skips the calibration
+            update for an optical sensor anyway)
+control 81  reset the optical blob
+control 82  the blob itself, 1204124 bytes in one piece
+control 22  set_enroll_session
+```
+
+Two of those were wrong here and are now fixed. Operation 76 answers 51 unless
+the caller declares a response capacity, exactly like operation 12. And the
+optical blob does not go through operation 81 at all: 81 only frees whatever
+the TA holds, and 82 appends, with a chunk index of 0 to 3 in the scalar field
+and up to `0x2a3000` bytes per chunk, the first chunk declaring the total. This
+port was sending the bytes to 81, which threw them away.
+
+Disassembling what the matcher's configuration is built from finally named the
+missing input. The TA carries a table of twenty-nine Samsung model codes —
+`A505`, `T865`, … `X916`, `S711` — and looks the running board up in it by
+name, storing the index in the sensor structure the matcher configuration is
+built from. Index 27 is `X916`, exactly what this tablet's kernel driver
+reports and what the stock service logs as `mi X916` at start-up. Control
+operation 88, the one this port had been sending empty, is that lookup.
+
+Two operations reach that setter, 88 and 90, and the difference between them
+is one log line: the 88 case also prints the name, and doing that over the
+non-secure buffer takes the TA down — QTEE then answers -90 to the invocation,
+and it happens for any declared payload length above zero. Operation 90 does
+the same lookup without the log and is accepted, so the bridge uses 90.
+
+With the model selected, control 76 answered, the optical blob uploaded
+through 82 and the enrolment session set, the initialisation now matches the
+stock trace call for call, and `EnrollInit` still answers 29.
+
+What remains is below all of that, and two measurements say so plainly.
+
+`Prepare` takes **1.06 seconds** here. The same command in the traced One UI
+cold start takes **32 milliseconds**. And it takes the same 1.06 seconds with
+the sensor's rail on as with it off — if the TA were running SPI transfers, an
+unpowered sensor would not cost exactly as much as a powered one. A second
+`Prepare` in the same session returns in 130 ms, which is the short path the
+handler takes once the state is no longer zero.
+
+Put together: the first `Prepare` runs the full path, spends about a second
+inside `fpsec_open_sensor` getting nothing, leaves the engine context
+unallocated and still reports zero in every field the caller can see. Every
+later failure follows from that — `enroll_init_v2` finds no matter at field
+`0x2f98` of a handle that was never built, and answers 29.
+
+So the remaining defect is that **TrustZone gets nothing from the EL721 over
+the secure SPI in this boot**, and the BAUTH command sequence above it is now
+correct. Command 16 is the one-line probe for it: it answers zero whether the
+sensor is powered or not, where stock reads a real type.
+
+Chasing why led somewhere embarrassing and simple. The reader's 3.3 V does not
+come from a GPIO-controlled LDO on this board: the stock node carries
+`etspi-regulator = "VDD_BTP_3P3"` and no `etspi-ldoPin`, and the fixups map
+that rail to the PMIC's `pm_humu_l2`. This port drives GPIO91 as if it were an
+LDO enable and never claims a supply at all, so the kernel log reads
+
+```text
+egis-el721 egis-el721: supply vdd not found, using dummy regulator
+```
+
+The device the port registers for the reader is synthetic and carries no
+device-tree node, so the `vdd-supply` written next to `egistec,el721` never
+reaches it. Claiming the rail by name from a test module gets a consumer onto
+`vreg_l2b_3p3`, but that regulator refuses both `regulator_set_voltage` and
+`regulator_get_voltage` with `EINVAL` and reports 0 mV, so it is not driving
+anything either.
+
+**The EL721 had never been powered under this port.** Everything above follows
+from that: no sensor answers, so TrustZone's `fpsec_open_sensor` spends a
+second getting nothing, the engine context is never allocated, and every
+biometric command answers 29. The driver now claims `vdd` and sequences it the
+way the stock driver does.
+
+Getting the rail itself to exist took three tries, and the reasons are worth
+keeping. It cannot be described in the board file: Samsung's ABL bootloops on
+any vendor_boot DTB whose structure moves, measured twice, and repacking that
+image with the tree untouched reproduces the working one to the byte, so the
+packing was never at fault. It cannot be added from `postcore_initcall`
+either — that panics before anything can be logged. What does work is adding
+it later, from a module, with `of_changeset`: a sibling `regulators-el721`
+node under the same RSC, carrying `ldo2`, plus a consumer node that references
+it by phandle. Giving that node its own platform device gets the RPMh driver
+to register the rail without disturbing the rails already up.
+
+The last obstacle there was arithmetic. The stock overlay asks this rail for
+3.3 V exactly, but mainline's PMIC5 p-type LDO steps 8 mV from 1.504 V and
+3.3 V lands half a step off the grid, so registration failed with
+`ENOTRECOVERABLE` until the constraint was widened to the neighbouring points.
+The rail now registers and enables at **3,296,000 µV**.
+
+With it powered, the TA's answer changes for the first time in this whole
+investigation: `Prepare` returns `sensor_type=0` where it had always returned
+the constant 8. It only does so when the rail is up *and* the GPIO lines are
+driven — rail alone, or lines alone, still give 8. So the reader is finally
+being reached, and what the TA now reports is that it cannot identify it.
+
+Narrowing that further ruled out the obvious suspects. GPIO91, which this port
+drives as if it enabled an LDO although the stock node declares no
+`etspi-ldoPin`, turns out not to matter: with the rail up and only the stock
+sleep line driven, the answer is the same zero. Neither a reset pulse on that
+line nor settling for 200 ms changes it, and `Prepare` still takes its full
+second. The reader has power, its enable line is high and it has been reset,
+and TrustZone still cannot identify it over the secure SPI.
+
+Two facts point at where to look next. The tablet's own clock tree shows
+`gcc_qupv3_wrap1_s2_clk` disabled with its source parked at 5.12 MHz, while
+the TA asks for 20 MHz; and `gcc_qupv3_wrap1_s7_clk` is enabled, so the
+wrapper itself is powered and its AHB clocks cannot be the whole story. The remaining gate is inside Samsung's engine
+rather than in the transport: the enrolment worker in `tz_vigis_api.c` reaches
+`fp_enroll_init` in `vigis_controller.c`, and that call returns failure. The
+same TA also validates authentication tokens — an all-zero `BAuth_Hat_OP`
+envelope (command 13, `0x48d`/`0x40c`) is rejected with 62 rather than ignored
+— so the token path is live and may well be the gate.
+
+The older risk has not gone away either: the TA also carries `BAuth_Hat_OP`,
+`BAuth_GetK_From_KM` and `BAuth_Generate_Challenge`, so enrolment may still
+require a Gatekeeper-signed authentication token that this platform cannot
+produce. That would be a boundary rather than a defect. If a template does come
+back, what remains is ordinary engineering: the identify loop and its control
+sub-opcodes, replacing the 45 ms Goodix poll with the sensor's own interrupt,
+template persistence across reboots, the GDM and session integration, and the
+validation matrix above.
+
+## The secure SPI pins belong to TrustZone, and must not be touched
+
+With the rail up, the panel awake and its optical mode engaged, `Prepare` still
+answers `sensor_type=0` and `EnrollInit` still answers 29, so the display state
+is not the gate either.
+
+The pin muxing looked like the next candidate, and the reasoning was sound as
+far as it went. `qup1_se2` — the serial engine behind `spi@a88000`, the one the
+TA's clock request names — spans `gpio36`..`gpio39` here, and pinctrl reports
+all four as `UNCLAIMED`: no Linux driver owns them, because neither the stock
+tree nor this port describes an SPI controller for the reader. The TA's own log
+strings name a matching failure, `qsee_tlmm_get_gpio_id: BLSP_CLK Failed`,
+which is what a serial-engine function lookup returns when no pin carries it.
+
+That hypothesis is wrong, and the way it failed is the answer. debugfs is
+locked down here, so `pinmux-select` returns `EPERM`; writing the four TLMM
+configuration registers directly from a module instead **hard-resets the
+tablet**. The kernel log of that boot simply stops — no shutdown sequence, no
+panic, nothing flushed — which is the signature of an XPU violation, not of a
+software fault.
+
+So those registers are secure-owned. TrustZone holds the pins exactly as it
+holds the serial engine, it muxes them itself, and a non-secure write to them
+takes the SoC down. `UNCLAIMED` in pinctrl means only that Linux has not
+claimed them, which is the correct and expected state on this board.
+
+Two things follow. The mux is not the defect and cannot be made one from
+Linux — that avenue is closed, and the module that tried it has been deleted so
+it cannot be loaded again by accident. And the reset is itself a positive
+result: it confirms that `gpio36`..`gpio39` really are the reader's secure SPI
+and that TrustZone owns that path end to end.
+
+## What 29 really was: the matcher was never built
+
+Disassembling the number to its source, rather than reasoning about it, ended
+the investigation. The chain is short and every link is checkable.
+
+`EnrollInit` reaches `fp_enroll_init`, which calls `matcher_api_enroll_init`,
+whose very first act is `enroll_init_v2`. That function asks the fingerprint
+context for its matcher object — field `0x2f98` — and fails immediately when it
+is null. Only one function in the whole TA ever writes that field, and it is
+reached only from `matcher_api_init`.
+
+`matcher_api_init` builds the matcher from one of two sources. If the model
+index is set it reads the matcher configuration from the global the model
+lookup fills. Otherwise it falls back to the sensor type and accepts only the
+values 1 to 4 — and on anything else it returns without building anything,
+which is exactly the silent path this port was taking. That also settles an old
+red herring: the `sensor_type` this port used to report, 8, would have failed
+that test just as surely as the 0 it reports now. Sensor identification was
+never the route to enrolment; the model index is.
+
+The model index is set by `fp_set_model_type`, and the dispatcher reaches it
+from two control operations. Reading the jump table at `0x27a0e0` names them
+exactly:
+
+| operation | what it does |
+| --- | --- |
+| 88 | `fp_set_model_type`, **then builds the matcher configuration** |
+| 90 | `fp_set_model_type` and nothing else |
+
+This port had been sending 90, on the belief that 88 crashed the TA. It does
+not: both operations log the model name identically, so the log was never the
+difference, and 88 accepts the same five-byte `"X916"` payload without
+complaint. The earlier failure belonged to how the call was framed, not to the
+operation.
+
+With the bridge switched to operation 88, `EnrollInit` answers
+`result=0 status=0 opcode=0` for the first time in this port's history, and
+`Cancel` — corrected to its measured 8-byte envelope — answers cleanly too.
+
+## Where the port stands after enrolment starts
+
+With operation 88 in place the whole enrolment chain runs, and a first live test
+with a finger on the reader measured exactly where it stops.
+
+```text
+EnrollInit user=User_0: result=0 status=0 opcode=0
+EnrollDo 1: result=0 status=-1 quality=0 progress=0 remaining=0
+EnrollDo 2: result=0 status=0  quality=0 progress=0 remaining=0
+EnrollDo 3: BAUTH command 3 failed (trustlet=39)
+```
+
+The reply is identical with a finger pressed on the reader and with the screen
+untouched, and the same 39 comes back from `EnrollFinal` when nothing was
+captured. So the state machine is correct and the sequence above it is correct;
+what does not happen is the capture itself.
+
+That is consistent with everything else measured. The TA's enrolment worker
+waits in `[ESTATE_FINGER_DOWN]` for `fpsec_start_get_image`, and finger
+presence on this reader is reported over the sensor's own link — the stock node
+declares no interrupt line, only `etspi-sleepPin`. With TrustZone getting
+nothing back over the secure SPI there is no finger-down to wait for, so the
+worker falls through and the capture returns empty.
+
+One open item therefore remains, and it is now stated much more narrowly than
+before: **TrustZone cannot read the EL721 over the secure SPI.** Power, the
+sleep line, the panel state, the pin mux and the whole BAUTH command sequence
+have each been tested and are not the cause. Until that is solved a finger
+cannot be enrolled, and until a finger can be enrolled the libfprint and
+fprintd integration cannot be validated.
+
+## Enrolment is an interactive protocol, and this port was not speaking it
+
+The captured One UI enrolment trace settles how a capture actually works, and
+it is not the loop this port was running. `EnrollDo` does not take an image and
+return it. It returns an **opcode** telling the non-secure side what to do next,
+and expects to be called again once that has been done:
+
+```text
+cmd 0x2  EnrollInit  -> opcode 0,  function_status 0   CAPTURE_READY
+cmd 0x3  EnrollDo    -> opcode 4,  timeout -1          BAUTH_OP_CODE_WAIT_INTERRUPT
+         (host enables the reader's interrupt, waits for it, disables it)
+cmd 0x3  EnrollDo    -> opcode 5                       BAUTH_OP_CODE_NOTIFY_DOWN
+         control 87, then control 80                   CAPTURE_STARTED
+cmd 0x3  EnrollDo    -> opcode 87
+         control 87
+cmd 0x3  EnrollDo    -> opcode 6                       NOTIFY_CAPTURE_SUCCESS
+cmd 0x3  EnrollDo    -> opcode 0,  function_status 1   CAPTURE_COMPLETED
+cmd 0x4  EnrollFinal                                   CAPTURE_SUCCESS
+         control 76, and the whole sequence repeats for the next capture
+```
+
+Two things follow that were not understood before. `EnrollFinal` runs once per
+capture rather than once per enrolment, each pass starting again at
+`EnrollInit`. And the earlier reading of the first live finger test — that the
+reader was returning "no finger" — was wrong: the port was calling `EnrollDo`
+repeatedly without honouring the opcode or issuing controls 87 and 80, which is
+why the TA eventually answered 39. The harness now implements the protocol.
+
+That correction does not make capture work, and it sharpens where it stops. The
+port's first `EnrollDo` answers `opcode 0` with `function_status -1`, where
+stock answers `opcode 4` at exactly the same point — so the failure is inside
+the first call, before any interrupt is ever waited for.
+
+The same trace also shows stock issuing `Challenge` (command 19) and then
+`Hat_OP` (command 13) before `EnrollInit`. `Challenge` succeeds here.
+`Hat_OP` does not: it needs its full 1165-byte envelope — anything else is
+refused with 51 — and refuses an all-zero envelope with 62. That is a
+Gatekeeper-signed authentication token, and this platform has no Gatekeeper to
+produce one.
+
+So two candidate blockers remain, and they have not yet been told apart:
+TrustZone getting nothing from the sensor, and the missing authentication
+token. The TA's own sensor self-test is control operation 19, and it is accepted
+when no response capacity is declared, which is the thread to pull next.
+
+## The reader answers an all-zero identity, and that is the whole defect
+
+Following the failure inside the first `EnrollDo` reaches the sensor rather than
+the token, which tells the two remaining candidates apart. `fp_enroll_state_handler`
+fails in `[ESTATE_INIT]` on a virtual call into the TA's own sensor driver, so
+the missing Gatekeeper token is not what stops a capture.
+
+The identification path then explains every symptom at once.
+`fpsec_open_sensor` calls `device_identify_type`, which polls
+`device_et7xx_get_fp_type` — a three-byte read of the reader's identity
+register — **twenty-one times**, one millisecond apart, giving up only when the
+type is still zero. That is exactly the second that `Prepare` costs here, where
+the traced One UI cold start costs 32 ms because it identifies on the first
+attempt. With no type, the TA binds no sensor driver, and every later call into
+that driver fails.
+
+So the defect is not in the command sequence, the matcher, the model, the
+protocol or the token: **the EL721 returns an all-zero identity to TrustZone.**
+
+One real fault was found and fixed while confirming this. The rail module drove
+the sleep line *before* enabling the rail, the reverse of the stock driver's
+order, which leaves the part without a clean reset because a signal pin is being
+driven into an unpowered chip. It now enables the rail, settles 2.3 ms, then
+takes the line low and raises it with the stock's 1.1 ms and 5 ms waits. That is
+correct on its own terms and should stay, but it does not change the answer: the
+identity still reads zero and `Prepare` still costs its full second.
+
+## The QUP serial engine route, tested and excluded
+
+The identity read timing — about 60 ms per attempt, twenty-one attempts — says
+the transfers are timing out rather than returning zeros quickly, which pointed
+at the serial engine itself. That has now been tested from every angle Linux can
+reach, and none of it is the cause.
+
+**Clocks.** The QUP wrapper's core clocks are reachable only straight from the
+GCC provider, having no consumer in the device tree, and mainline leaves them
+gated. Holding `gcc_qupv3_wrap1_core_2x_clk`, `gcc_qupv3_wrap1_core_clk`, the
+`m_ahb`/`s_ahb` pair and the serial engine's own branch all on at once, with the
+interconnect paths voted, changes nothing: the identity still reads zero and
+`Prepare` still costs its full second. The captured stock kernel trace settles
+why that was never promising — Android does not touch `gcc_qupv3_wrap1_s2_clk`
+during fingerprint activity either, so enabling it was never the HLOS's job.
+
+**Callbacks.** Stock registers a "QSEE Interrupt Service Listener" at boot, which
+raised the possibility that TrustZone waits on the non-secure world to forward
+the serial engine's interrupt — a good fit for 60 ms timeouts. It does not
+apply. This port's bridge already runs a supplicant that services secure-world
+callbacks, and instrumenting it shows the TA making exactly two callbacks up
+front and then none at all across the 1.2 seconds of the identification loop.
+TrustZone is not waiting on us; it is driving the bus itself and getting
+nothing back.
+
+What remains unexamined is the serial engine's own state — whether it is
+configured and running at all — and those registers cannot be read from Linux
+without risking the same XPU fault that the pin experiment produced.
+
+## One UI says the sensor type is 8, and that changes the diagnosis
+
+Booting the stock firmware and asking its own driver, with the reader working,
+settles what a correct reading looks like:
+
+```text
+name         EL721
+vendor       EGISTEC
+type_check   8
+bfs_values   "FP_SPICLK":"20000000"
+```
+
+**Eight is the right answer.** It is exactly what this port reported before any
+of the power work, and what was written off here as a constant the TA already
+knew. The zero it reports now is the broken reading, not the honest one — this
+document had it backwards, and so did every conclusion drawn from it.
+
+The stock driver's periodic state dump says the rest:
+
+```text
+fps_el7xx_work_func_debug: ldo: 0, sleep: 0, tz: 1, spi_value: 0x0, type: EL721
+```
+
+At idle the LDO pin is low and **the sleep line is low**, where this port holds
+it high continuously. So the two defects were masking each other. While the port
+reported the correct 8, enrolment failed for an unrelated reason — the model was
+being selected through operation 90, which never builds the matcher. By the time
+operation 88 fixed that, the reader had been moved into a state that reports 0.
+
+What this predicts is specific and cheap to test: back under Ubuntu, without the
+rail module driving the sleep line, `Prepare` should report 8 again, and with
+the model now selected through 88 the enrolment chain should run against a
+sensor that answers.
+
+## The earlier enrolment success was on a degenerate path
+
+Back under Ubuntu with nothing forcing the sleep line, `Prepare` reports
+`sensor_type=8` again, exactly as One UI does. That confirms the reading above
+and forces a correction to the section before it.
+
+Operation 88 was reported here as the fix that made `EnrollInit` succeed. It
+does — **but only while the reader has not been identified.** With the sensor
+answering 8, operation 88 takes the TA down with `-90` every time: before the
+optical blob and after it, with a declared response capacity and without, sent
+from the bridge's own init or from the harness. It never crashed earlier only
+because the rail module had driven the reader into the state that answers 0, so
+the TA had bound no sensor driver and the call stopped short of
+`fp_check_white_spot_and_apply_wsc_to_wk_bk`.
+
+So that `EnrollInit user=User_0: result=0` was a matcher built over an
+unidentified sensor. It could never have enrolled a finger, and the claim that
+enrolment "starts" was wrong.
+
+With the reader answering properly the position is:
+
+| model selection | result |
+| --- | --- |
+| operation 88 | the TA goes down with `-90` |
+| operation 90 | `EnrollInit` answers 29, the matcher is not built |
+| skipped | `EnrollInit` answers 29 |
+
+One suspicion was checked and cleared while narrowing this. The per-device
+factory calibration `fp_check_white_spot_and_apply_wsc_to_wk_bk` needs is not
+missing: `sec_efs/biometrics/meta/egis_calibration_data.bin` is byte-identical
+to the port's `calib.dat`, the optical blob matches the size the stock service
+uploads, and the stored `cell_id` matches the panel's. The inputs are right.
+
+The default therefore goes back to operation 90, which leaves the matcher
+unbuilt but cannot crash the TA; `EL721_MODEL_OP` selects the other.
+
+## What the reader must answer, to the byte
+
+The identification is a three-byte read, and the TA maps it with no room for
+interpretation:
+
+| bytes 4 and 5 | sensor type |
+| --- | --- |
+| `07 0D` | 2 |
+| `07 0F` | 3 |
+| `07 15` | 4 — the ET721, this reader |
+| anything else | 0 |
+
+The driver selector then binds a sensor driver for **2, 3 and 4 only**. Every
+other value, zero included, leaves `[0x4a0310 + 0x150]` null, and that null is
+the crash: `fpsec_get_badpixel_map_EL721` loads its method from that pointer's
+vtable, which is where operation 88 takes the TA down.
+
+This corrects the section above it, which was too quick. One UI's `type_check`
+of 8 is the **kernel driver's** own enum, not the TA's, and the two are not the
+same scale — the TA has no type 8 at all. So the port reporting 8 was never
+evidence that the reader had been identified, and neither 8 nor 0 binds a
+driver. Both mean the same thing: the reader did not answer `07 15`.
+
+That is the defect, stated as precisely as it can be: **the EL721 does not
+return its identity bytes to TrustZone over the secure SPI.** Everything else —
+the transport, the command envelopes, the model table, the matcher, the
+interactive capture protocol, the calibration inputs, the rail and its
+sequencing — is correct and verified. Nothing above this layer can work until
+the reader answers, and the answer it must give is `07 15`.
+
+## Cold-boot parity and the early-rail boot regression
+
+A cold One UI trace removes the last ambiguity in the non-secure power path.
+At uptime 8.707239 it enables `VDD_BTP_3P3`, at 8.719568 it raises GPIO155,
+and only then enters `smcinvoke`. It neither claims nor drives GPIO91, and it
+does not ask HLOS to claim or clock the secure QUP engine. This is the sequence
+the port must reproduce: PMIC rail first, GPIO155 second, trusted call last.
+
+Three Ubuntu A/B images then reset between ABL decompression and the first
+persisted Linux message: an incremental build without GPIO91, a clean build
+without it, and a same-tree rebuild with GPIO91 restored. All kept the known
+DTB hash `613b3bb7...`; all failed before a panic or kernel log existed. The
+known-good `boot.img` (`9d4ace88...`) boots with either module set and its
+kernel contains no `vreg_l2b_3p3` publication code. GPIO91 is therefore not the
+cause of this bootloop.
+
+The common delta was `postcore_initcall(el721_add_rail)`, which changed the
+live OF tree while core providers were still starting. That path has been
+removed. The companion now probes with no supply mutation and publishes the
+already-validated `regulators-el721` sibling only on the first explicit
+fingerprint power request. It uses the PMIC5-valid 3,296,000–3,304,000 µV
+window, attaches the synthetic consumer after the changeset is live, and
+allows the RPMh regulator driver to finish binding before acquisition.
+
+The redesigned driver and complete experimental kernel compile cleanly;
+`checkpatch.pl` reports no warnings and the linked image has SHA-256
+`1539dd48f6562a39edab3cad6dfe03e1b896d82102a6f1ae14e1453166c9be13`.
+The same late changeset was first loaded on the stable tablet with power
+disabled, registered `vreg_l2b_3p3`, and reverted cleanly without a reboot.
+The reviewed image was then packed as Android v4 boot
+`d315e4ffc751a6fb2e96ccb5b49fa623c0dfe760000882bcbd5e552574d7cbb4`
+and booted on the first attempt. At idle `/el721-supply` was absent and the
+companion reported the sensor off. Its first explicit power request created
+the supply, registered the regulator at 3,296 mV and raised its consumer count
+to one; powering off returned that count to zero without a reset or warning.
+
+The current QTEE-backed self-test then loaded the signed `dualfp` application
+and ran calibrated `Prepare`. Transport, invoke result, function status and
+opcode were all zero. That reply was initially rejected because word zero was
+still being interpreted as an internal sensor type.
+
+## A zeroed `Prepare` is success, and `EnrollInit` now works
+
+The stock cold-start log resolves the ambiguity in that response. Its public
+type `8` comes from command 16, the separate `TypeCheck`; after command 1 it
+logs a successful `check_opcode` with every status field zero. The `8` once
+seen in word zero of Ubuntu's unpowered `Prepare` was a host-work/reset status,
+not an EL721 identity. Treating it as the sensor type both skipped that work
+and made the properly powered all-zero reply look like failure.
+
+A signed diagnostic module then reproduced the complete stock sequence from a
+cold Ubuntu boot: GPIO155 was acquired low, the regulator load was set to
+100 mA, `vreg_l2b_3p3` was enabled at 3,296 mV, the stock 2.3 ms delay elapsed,
+and only then was GPIO155 raised. Calibrated `Prepare` returned `0/0/0/0` and
+continued successfully through control 76 and the optical blob upload. The
+module always lowered GPIO155, disabled the rail, removed the temporary
+regulator node and unloaded QCOMTEE on exit.
+
+The remaining matcher failure was the model selector. Operation 90 only stores
+the `X916` table index and leaves the matcher absent, so `EnrollInit` answers
+29. Operation 88 performs the same lookup and constructs the matcher. With 88
+as the default, the physical tablet now reports:
+
+```text
+Prepare:       status=0 result=0 function_status=0 opcode=0
+EnrollInit:    result=0 status=0 opcode=0
+Cancel:        result=0 status=0 opcode=0
+```
+
+This supersedes the earlier secure-SPI diagnosis and the claim that operation
+88 succeeds only on a degenerate path. The sensor and trusted path initialise
+well enough to create the real matcher and enter enrolment. A single
+non-interactive `EnrollDo` without HBM, a finger or the Android pre-enrol token
+sequence returns status `-1` and no template, as expected; physical capture is
+the next unproven boundary.
+
+Controls 45 and 46 were also mislabelled in the early bridge as a wrapped
+active-group-key pair. Static names and the stock trace identify them as secure
+authenticator-ID operations, while Android's active-user path uses storage
+operation 48. The self-test no longer sends 45/46 by default.
+
+The corrected complete libfprint driver builds in the pinned ARM64 environment
+without an EL721 warning. Package `gts9u4` was installed over `gts9u3` after
+backing up the previous library. Through the system library — not an injected
+test copy — the tablet enumerated the EL721, loaded `dualfp`, completed the
+all-zero `Prepare`, selected `X916`, uploaded the optical blob, opened the
+device and closed it with the rail off. The two owner-derived calibration files
+were also installed in the firmware directory the production driver uses; no
+template or fingerprint image was read or written.
+
+## The production enrol path now consumes physical FOD events
+
+Running the driver through `fprintd-enroll` exposed integration faults which
+the standalone harness could not show. A second `Prepare` in the already-open
+QTEE session was rejected with BAUTH status 29, so operation setup now only
+restores sensor power. The ten libfprint finger identifiers are mapped
+deterministically onto BAUTH's four secure template slots; the four-print limit
+and collision policy still need a user-facing decision.
+
+Optical mode has also been made suitable for a real enrol operation. Libfprint
+refreshes `fod_mode` every five seconds so the panel's 15-second safety
+watchdog cannot terminate HBM in the middle of enrolment. It no longer tries
+to call a user's D-Bus session from root. Overlay version 7 instead polls the
+panel's `fod_mode` and follows that kernel state. This ordering is important:
+the temporary test watcher could show its compensating black shade before HBM
+was active, briefly making the entire desktop and target darker before the
+panel brightened. Version 7 should remove that race, but it remains a visual
+acceptance test after GNOME Shell loads the new extension version.
+
+The Goodix touch sponge can publish a press and release between two 45 ms
+polls. The driver therefore records the sequence number in `fod_state` and
+treats a newly latched release as one contact when the press was missed. With
+package `gts9u9`, physical contacts at the stock FOD coordinates reached the
+real `EnrollDo` command through the system fprintd service. Cleanup returned
+`sensor_power`, `fod_enable` and `fod_mode` to zero.
+
+Those calls returned the same `-1, 0, 0` sequence as the earlier tokenless
+harness and produced no template. This proves the complete desktop-to-touch-
+to-BAUTH path, but not secure capture. Stock sends `Challenge` and a
+Gatekeeper-signed `Hat_OP` before `EnrollInit`, then follows the interactive
+opcode 4/5/87/6 loop with controls 87 and 80. The production driver does not
+yet supply such a token or implement that complete loop. No fingerprint image,
+template or Android authentication token has been copied from the device.
+
+The command-13 envelope has since been reproduced field for field from the
+stock gateway rather than as a zero-filled raw command. It contains the packed
+69-byte Android hardware-auth token at offset 4, a selector at 73, up to 1024
+bytes of optional payload at 77, its length at 1101 and the 60-byte challenge
+record at 1105. Command 19 returns that challenge record at output offset 8.
+The bridge now has typed calls for both commands.
+
+The distinction changes the diagnostic result. A completely empty command-13
+body still returns 62, but a freshly generated challenge plus a HAT carrying
+the correct challenge ID and no HMAC reaches the authentication check and is
+rejected with secure-world code 28. Thus 62 was an invalid challenge envelope,
+not proof of a parsed but unsigned HAT. Code 28 is the first direct evidence
+that the remaining pre-capture boundary is a legitimately signed hardware
+authentication token. The test generated no credential and deliberately did
+not import one from Android.
+
+## Gatekeeper authorization and the complete capture transaction
+
+The remaining HAT boundary is now implemented without Android credentials.
+Ubuntu creates a random, root-only Gatekeeper identity, re-enrols that same
+secret into Samsung's `skeymast` instance for each QTEE session, verifies the
+current BAUTH challenge and receives a signed 69-byte HAT. Before verification,
+`skeymast` command `0x203`, dualfp command 15 and control 49 provision the
+target-bound HMAC key entirely inside TrustZone. `Hat_OP` now returns zero and
+`EnrollInit` returns zero; neither a user password nor an Android PIN, HAT or
+template is read.
+
+The response layout of command 3 was also corrected from the stock gateway.
+Its real opcode is output word zero; timeout is at `+8`, function status at
+`+12`, and the three enrolment metrics at `+16/+20/+24` with progress and
+remaining reordered by the gateway. A physical capture now follows the
+measured sequence `4 → 5 → 87 → 6/0`, closes with `EnrollFinal` even on
+BAD_QUALITY 39, and starts the next transaction with `EnrollInit`. This avoids
+the old permanent `0x80000000` sentinel after one rejected image.
+
+Opcode 5 uses control 87 with one byte of input and control 80 with four;
+opcode 87 uses control 87 with one. The old bridge had mistaken those fields
+for response capacities. Static analysis of `TeeProxy::ControlOp` and
+`BAuth_Control_OP` proves that the third pointer and following length are
+copied into the command-12 input payload. For control 80, Samsung fills that
+four-byte input with `/sys/class/power_supply/battery/temp`; Ubuntu exposes the
+same tenths-of-a-degree value through `sm5714-battery/temp`. The reversed
+framing made control 80 return 51 and is corrected in `gts9u26`. The earlier
+98.7% estimate is superseded below.
+
+The first physical `gts9u26` run then exposed the remaining value mismatch.
+One UI's live optical-capture trace prints `tfd 2 0 1` at NOTIFY_DOWN and the
+following capture step. With its override field clear, control 87 receives the
+first byte: **2 (finger pressed)**. Ubuntu had sent zero. That still allowed a
+few images through, but after repeated quality retries the trustlet terminated
+the partially populated enrolment with result 70. The production path and the
+self-test now send the measured pressed state 2.
+
+## Full-coverage capture and the HwVault boundary
+
+The 2026-08-26 Ubuntu tests establish the following:
+
+- fprintd's `ProtectSystem=strict` originally prevented saving the new local
+  Gatekeeper state. Adding `StateDirectory=gts9u-fingerprint` permits just its
+  private state directory, alongside the stock `fprint` directory. The new
+  directory is root-only (0700); the 99-byte state file is 0600. The obsolete
+  copy in fprintd's per-user print directory was removed after the replacement
+  was present; no Android credential was involved.
+- Real captures complete `4 → 5 → 87 → 6 → 0`. Opcode 63 is an acquired/progress
+  callback, not a missing control request. The bounded loop now handles it.
+- The first metric is increasing coverage; the third is accepted-sample count,
+  not samples remaining. A run reached 17 accepted samples and coverage 100.
+  The timeout now measures 90 seconds of inactivity between transactions, not
+  the total duration of enrolment. Rejected samples still close with Final
+  before starting the next Init.
+- Result 70 was temporarily treated as a retry in the deployed `gts9u20`
+  experiment. Stock `enrollDo` treats it as an error, so `gts9u21` restores that
+  behaviour. Only the stock recoverable results 39/41 are retried; a fatal
+  result must not be hidden by a simultaneous retry code from Final.
+- At full coverage, EnrollDo returned result 71 with zero template bytes.
+  EnrollFinal returned zero but no template. Static analysis follows this to
+  `encode_each_templ_ver3 → getTemplateEncryptionKey → HwVaultHal_deriveKey`.
+  Result 71 is a key-derivation failure, never a successful enrolment.
+
+The stock gateway extracts the **encrypted template from EnrollDo** at
+`+0x1c`, using length `+0x22601c`, maximum `0x226000`, in an output of
+`0x230024` bytes. EnrollFinal's optional `0xa000`-byte payload is bitmap/debug
+output and must not become an `FpPrint`. Package `gts9u21` validates and copies
+only a successful terminal EnrollDo template, preserves it across Final's
+shared-buffer overwrite, and publishes it only if Final also succeeds.
+It does not copy Final bitmap data or log any template bytes.
+
+`scripts/test-el721-enroll-wire.sh` provides 11 offline synthetic tests:
+successful copying, empty/max/oversized/overflow lengths, short/long/null
+responses, key failure, intermediate opcodes and partial coverage. These pass
+in the ARM64 build environment; they do not substitute for real enrol/verify.
+They also pass with UndefinedBehaviorSanitizer. AddressSanitizer under the
+emulated build environment exited without a diagnostic, so no ASan pass is
+claimed. The ARM64 `gts9u21` package built successfully and was installed on
+the tablet; libfprint enumeration, Prepare and close passed without a capture
+or reboot. It has since been superseded by the integrated `gts9u22` package
+documented in the latest checkpoint below.
+
+### HwVault investigation (no Android state imported)
+
+Samsung's signed `hwvault.b00`–`b08` were read from the tablet's APNHLOS firmware
+partition, mounted read-only. The assembled 1,101,912-byte TA loads and unloads
+successfully via QTEE. The firmware remains a local, ignored artifact and is
+not distributed by this repository. Loading it alone is not sufficient:
+its `get_derived_key` explicitly reads cached credential index 11, then derives
+the requested key for the caller. Android's live reference logs show that same
+index. No cached credential or Android vault file was read.
+
+Static analysis identified commands `0x271b` (generate a wrapped HwVault root)
+and `0x271c` (load one into the TA). A bounded generation diagnostic returned
+status **9936** and no wrapped bytes, so it performed no SetRoot and saved no
+file. That result originally suggested that Ubuntu needed its own StrongBox
+root. Later One UI tracing disproved the premise: the fingerprint service does
+not generate a new root during normal startup. It restores existing,
+authenticated K250A credentials into each fresh HwVault instance. The failed
+generator remains useful negative evidence, but it is no longer the path being
+implemented.
+
+### K250A transport and authenticated credential exchange
+
+Samsung's GPL K250A driver has now been ported to the mainline 7.2 kernel. The
+shipping board connects the secure element to QUP SE10 I2C at address `0x23`
+and powers it from PM8550VS-G LDO2 at 1.8 V. The boot-compatible DTB already
+contains that controller but marks it disabled. To avoid another ABL bootloop,
+the module applies a reversible live-device-tree changeset, instantiates the
+controller and client only while loaded, and restores `status = "disabled"`
+on removal. It drives the dedicated LDO through the public RPMh interface.
+No replacement DTB or persistent firmware state is involved.
+
+The signed module was exercised on the tablet under kernel lockdown. Load,
+open/power, unload and live-DT rollback all succeeded. `CORE_OPEN` returned
+`9000`, establishing end-to-end RPMh, GENI I2C and ISO7816 T=1 transport. The
+module deliberately returns `ENODEV` for the absent reset GPIO, matching the
+stock X910 DT and driver behaviour instead of simulating a reset by cycling
+power.
+
+The authenticated K250A exchange has since been reproduced completely; see the
+latest checkpoint below. No Android file, PIN or userspace credential was read,
+imported or changed.
+
+### SPSS userspace boot coordination
+
+The clean SPSS transport test proved that `qcom_spss`, GLINK, SPCOM and all six
+`sec_nvm` service channels work. One UI's successful sequence has an additional
+process, `spdaemon`, between SPSS boot and Keymaster use. Static analysis of Samsung's
+`libspcom.so` found that this is not coordinated through `/dev/spcom`: the
+library opens `/dev/spss_utils` and uses the exact legacy event ABI
+`WAIT_FOR_EVENT`, `SIGNAL_EVENT` and `IS_EVENT_SIGNALED`. The event IDs are 0
+(`pil_called`), 1 (`nvm_ready`) and 2 (`spu_ready`). The previously ported
+SPCOM source even declared `spss_utils` as a soft dependency, but that second
+driver had not been included.
+
+The experimental kernel now packages a mainline adaptation of Samsung's GPL
+`spss_utils` driver. It preserves the stock IOCTL numbers, structures, status
+values and duplicate-signal behaviour, creates `/dev/spss_utils`, and ties
+power-up/power-down event reset to the actual SPSS `remoteproc` lifecycle. The
+bootloader-sensitive DTB remains untouched: `qcom_spss` publishes both
+userspace bridge devices below its dynamically created remote processor.
+Samsung's downstream IAR/CMAC handoff is not emulated because it requires a
+hypervisor memory-assignment API absent from this mainline platform; attempts
+to use it fail explicitly instead of reporting a false secure handoff.
+
+A delayed manual launch also exposed an ordering constraint. SPSS advertises
+`cryptoapp`, `sp_keymaster` and `sp_nvm` shortly after GLINK comes up, and its
+production firmware no longer completed a symmetric OPEN requested much later
+by `spdaemon`. Predefining those application channels in SPCOM was tested and
+then rejected: the stock SM-X910 DT defines only `sp_kernel` and `sp_ssr`.
+Android instead starts `sec_nvm` and `spdaemon` as part of the same boot
+sequence. Ubuntu must preserve that split and coordinate userspace with SPSS
+startup, rather than changing the kernel's channel ownership model.
+
+The modules compile cleanly against Linux 7.2, pass `checkpatch` with no errors
+or warnings and are signed by the same kernel build key. Subsequent hardware
+work established the shared `qcom,sp-hlos` DMA-BUF heap and the complete SPSS
+startup path. More importantly, tracing the consumer showed that generating a
+new HwVault root was the wrong success criterion; the normal fingerprint path
+is the authenticated credential restore documented next.
+
+## Authenticated HwVault restore and integrated fprintd
+
+This early 2026-09-02 checkpoint established authenticated transport, not usable
+template encryption. The later full-coverage test exposed a hidden cache failure;
+see the latest checkpoint below. Its original claim that the encryption gap was
+closed was incorrect.
+
+- Reverse engineering Samsung's `libese-grdg.so` established the namespace
+  selector in the K250A GET APDU: `P1=1` for persistent credentials and `P1=0`
+  for ordinary credentials. One UI restores persistent indices 0 and 1, then
+  ordinary index 11.
+- Ubuntu now selects the `SECURE_NVM` applet, obtains a fresh nonce, asks
+  HwVault command `0x2714` to sign each GET, reads the encrypted credential and
+  response authenticator from K250A, and returns both to command `0x2715` for
+  verification and caching. The measured payloads are 353 bytes (index 0),
+  2,533 bytes (index 1), and 185 bytes (index 11); every HwVault status is zero.
+- `libfprint` retains that restored HwVault object for the complete EL721
+  session. A tablet self-test then completed BAUTH `Prepare` with transport,
+  result, function status and opcode all zero, reported bootstrap 76/model 88,
+  loaded the optical calibration blob and exited `PASS`.
+- The real systemd sandbox grants only `/dev/tee0` and `/dev/k250a` in addition
+  to its existing policy. `fprintd-list agcar` detects `EgisTec EL721 UDFPS`
+  through the installed package and exits zero. No fingerprint is currently
+  enrolled.
+- The 11 synthetic encrypted-enrolment protocol tests pass in the full ARM64
+  package build. Installed package:
+  `1:1.94.7+tod1-0ubuntu5~24.04.8+gts9u22`; SHA-256:
+  `c8272978855f837f98e36de06e08b37acfb6410efbe6c4c3cacabf11760e1ab9`.
+
+The proprietary signed TAs and device calibration remain user-supplied,
+hash-validated local firmware and are not distributed by this repository. The
+restore uses only authenticated GET operations against the tablet's secure
+element; it does not import Android files, a PIN or a fingerprint template.
+
+The 99% estimate recorded at this checkpoint was premature and is withdrawn.
+Physically enrolling a fresh finger into an encrypted template, verifying the
+same and a different finger, and validating cancellation, lockout, PAM/GDM and
+the lock-screen FOD overlay are substantial outstanding acceptance tests. See
+the current assessment at the top; protocol infrastructure is not proof of a
+working biometric feature.
+
+The latest physical run also established that the Goodix firmware normally
+publishes one `released` record rather than separate press/release records.
+The driver now consumes the first isolated release after enabling FOD as a
+stale arming event and accepts subsequent releases as real contacts. The user
+confirmed that the target appears correctly on repeated touches. Captures
+reached 96% coverage and 16 accepted samples before the incorrectly framed
+control path returned EnrollDo result 70. Samsung maps 70 to its system-failure
+state, so the temporary retry was removed rather than hiding or looping the
+failure. The corrected `gts9u26` package is the next physical enrolment test.
+
+## Press-capable Goodix path and persistent test reports
+
+The current kernel no longer waits for the firmware's late dedicated FOD
+release gesture. Its first ordinary coordinate press inside
+`854 2732 994 2872` publishes `pressed`, suppresses that contact from the
+desktop, and publishes `released` when the slot ends. This starts secure
+capture while the finger is still covering the optical reader.
+
+Once userspace observes that press-capable protocol it permanently disables
+the older release-only fallback for the current operation. The firmware can
+publish a second dedicated release after the synthetic coordinate release;
+treating it as another contact caused one no-finger capture per real touch,
+many result-39 quality retries and eventually fatal result 70. Package
+`gts9u29` contains this fix, uses the trustlet's measured 17 enrolment stages
+and emits one compact aggregate sample record for diagnostics.
+
+Tab Companion 1.1.3 exposes the bounded test under Info. A completed run is a
+normal right-index enrolment; timeout, Stop and Escape cancel without saving a
+partial template. Live coverage, accepted samples, retries and the secure
+result are shown in the window. The latest report is always:
+
+```text
+~/.local/state/tab-companion/fingerprint-tests/latest.jsonl
+```
+
+Timestamped siblings retain earlier runs. Records contain timing and aggregate
+result fields only; raw images, template contents, HATs and vault credentials
+never leave their existing secure boundaries.
+
+The press-capable kernel is now a required part of this feature branch, so
+userspace no longer treats isolated legacy RELEASE events as captures. The
+firmware can emit those events while FOD mode is starting; accepting them
+caused a false first stage before any touch. Per-contact and per-sample
+aggregate records use journal level MESSAGE so the persistent test report sees
+them without enabling global libfprint debug output.
+
+The first fully instrumented run contained 31 genuine PRESS captures: 30
+returned quality result 39, one reached 2% coverage/one accepted sample, and
+the next capture exhausted the trustlet's 30-retry budget with result 70.
+Every matching RELEASE had `capture=0`, confirming that duplicate capture is
+fixed. Package `gts9u31` tested a 250 ms press-settle interval and recorded
+press coordinates plus actual hold time. The follow-up run placed every long
+contact around the physical centre `(924, 2802)` and still returned result 39,
+so neither alignment nor settling explains the regression.
+
+The earlier high-yield runs processed the sample after RELEASE. The sensor
+acquires while covered, but that paired Samsung event is the point at which
+its buffered optical image is ready for the trustlet. Package `gts9u32`
+therefore captures on exactly the first RELEASE following a real PRESS.
+Isolated startup releases and the later duplicate release have no preceding
+live contact and cannot consume a sample.
+
+## Deterministic 62% boundary
+
+Two release-timed diagnostics accepted exactly 10 physical samples, reached
+62% coverage and returned result 70 on the following contact. They failed at
+53 and 64 seconds respectively, ruling out both a fixed session timeout and a
+quality-retry budget. Tab Companion 1.1.4 retained the terminal aggregate in
+the second report as intended.
+
+The `CAPTURE_FINGER_LEAVE` message in Samsung's service trace is followed by
+control 76, but that operation requests the 1024-byte `adlg` diagnostic blob;
+it is not a finger-state transition. Calling it with no response capacity only
+produces the already-known non-fatal shape status 51 and cannot repair result
+70. Package `gts9u34` therefore removes that probe and records every EnrollDo
+step as `opcode:result:status` in the compact per-sample journal line. This
+will show whether the 62% failure occurs before sensor capture, during an
+intermediate opcode, or in the enrolment algorithm's terminal reply.
+
+The resulting trace isolated the boundary to
+`4 -> 5 -> 87 -> 63 -> result 70`. Static analysis of Samsung's current
+`libsfp_sensor.so` shows that opcode 63 emits the ordinary enrolment-progress
+callback and returns zero, after which stock `enrollDo` immediately calls the
+TA again. The missing distinction was earlier: stock obtains opcode 4, arms
+the sensor interrupt and waits for a physical finger-down before the next
+EnrollDo. Ubuntu instead entered the whole loop after RELEASE, so the TA's
+milestone continuation ran without a finger and aborted.
+
+Package `gts9u35` preserves that asynchronous boundary. Each EnrollInit is
+followed immediately by exactly one EnrollDo that must return opcode 4. The
+driver then waits for the kernel's paired PRESS, completes `5 -> 87 -> 6/0`
+while the finger is present, closes with EnrollFinal, starts the next Init and
+arms its opcode 4 before returning to the poller. RELEASE now only clears the
+contact latch. This matches the order in the successful One UI trace without
+requiring Android state or a reboot. The ARM64 build and all 11 protocol tests
+pass; package SHA-256 is
+`edf390dd414e83ab2d0159e91eaa0fdf8d1a893f476b176cf69fbe9957f61c23`.
+It was installed live over `gts9u34` while fprintd was inactive.
+
+The first `gts9u35` diagnostic proved the pre-arm path but rejected long
+contacts: 12 quality retries, four accepted rapid lift-offs and then result 70
+at 8% coverage. Every accepted image occurred when RELEASE arrived while the
+press-time EnrollDo sequence was still running. Thus opcode 4 must remain
+pre-armed, while this Ubuntu touch/sensor path still requires the paired
+release before consuming the buffered image.
+
+Package `gts9u36` splits one secure transaction across the contact. PRESS
+resumes the pre-armed opcode 4 and handles only opcodes 5 and 87 plus their
+measured controls. The driver then leaves that transaction open. Its paired
+RELEASE resumes EnrollDo to obtain opcode 6/0, closes with EnrollFinal, starts
+the next EnrollInit and pre-arms opcode 4 again. The saved compact trace
+reconstructs all three pre-release opcodes across the asynchronous boundary.
+The ARM64 build and all 11 wire tests pass; package SHA-256 is
+`0f107c9585221cf7b42ef98a34e88f4ea86d00e2a64ea1d6990df7af47443881`.
+It was installed live while fprintd and both FOD endpoints were idle.
+
+## Optical exposure investigation (2026-09-02)
+
+The `gts9u36` physical run returned 30 quality retries, three accepted samples,
+6% coverage and fatal result 70 after about 60 seconds. This falsifies the
+previous claim that waiting after opcode 87 would fix the image. The user
+confirmed that there is no screen protector and enrollment works in One UI.
+
+Read-only analysis of the locally supplied signed `dualfp` image established
+the following (addresses are virtual addresses in this particular build):
+
+- `fp_enroll_state_handler` calls `fpsec_do_get_image_only` at `0x1c954`,
+  before returning opcode 87 from `ESTATE_GET_TSP_STATUS` at `0x1e21c`.
+  Delaying after 87 does not delay acquisition.
+- `do_enroll_stub` at `0x17198` converts an already-fatal internal result 70
+  into opcode 63, latches a flag, and returns 70 on the next call via
+  `0x16fc0`. The host's callback handling does not cause that abort.
+- Internal abort paths include repeated quality failures and
+  `check_phone_case` (`0x27504`), which aggregates an optical metric over
+  eight observations. This does not establish that the tablet has a case or
+  protector; it rules out treating every 63/70 as a coverage milestone.
+- Control 87 (`do_extra_control`, `0x186a0`) only calls
+  `fp_set_finger_off` for input byte **1**. Both 0 and 2 are no-ops, so the
+  earlier claim that changing 0 to 2 repaired the secure state was unfounded.
+
+The successful One UI reference consistently reports `HBM=385` before each
+contact. Samsung's `GTS9U_ANA38407_AMSA46AS02.dat` maps platform level 385 to
+WRDISBV **1623 / 634 cd/m2** and HBM WRDISBV 2047 to **900 cd/m2**. The port
+was using 2047 and incorrectly documenting it as fingerprint 650 cd/m2. The
+panel correction uses 1623, exposes it read-only as `fod_brightness`, and
+adjusts GNOME's shade estimate to 634. Actual overexposure is a hypothesis to
+test, not a result established by these tables.
+
+`gts9u37` removes the disproven split-at-87 wait, restores the stock press-time
+transaction, records monotonic capture duration, and removes enrollment-only
+gating from verification contacts. No TA, calibration or matcher threshold is
+modified. The kernel change leaves the DTB and kernel configuration identical
+to the previous booted build. Only the Ubuntu boot image needs replacement;
+Android, vendor_boot, init_boot, dtbo, vbmeta and the module tree stay untouched.
+
+The ARM64 package build and all 11 encrypted-wire tests pass. Kernel
+checkpatch reports no errors or warnings. The corrected kernel booted Ubuntu
+successfully, `fod_brightness` reports 1623, the overlay is active, and HBM
+returns to zero while idle. No systemd units failed after this reboot.
+
+- Ubuntu `boot.img` SHA-256:
+  `5269f2fd1bf98b81f92559ae4502dfd2d6b3fd8334efa63203d1736573c7544b`.
+- `gts9u37` package SHA-256:
+  `982ca2de7537566c0c05d4a51f8e6e6db19fc629a782d39abe9a32a1d3c4afec`.
+- Verified previous boot and overlay are retained on the tablet in
+  `/var/lib/gts9u-kernel-backups/pre-el721-fod385`.
+
+Physical enrollment and same/different-finger verification remain outstanding;
+the boot and build checks do not establish improved capture quality.
+
+## Full coverage and hidden StrongBox failure (2026-09-02)
+
+The subsequent `gts9u37` physical test, 17:19:25–17:20:11 UTC, accepted **17
+samples**, reached **100% coverage**, and needed only **two quality retries**.
+This supports the corrected optical exposure/press-time capture path. However,
+the last EnrollDo returned **72**, with **zero encrypted template bytes**;
+EnrollFinal returned zero. `fprintd-list` confirms no saved fingerprint. This is
+not the earlier result-70 capture abort and must not be counted as enrollment.
+
+Static analysis and a bounded, non-biometric Ubuntu diagnostic now establish
+the failure chain:
+
+- `dualfp:getTemplateEncryptionKey` maps HwVault result **7** to EL721 **72**
+  at `0x2f60`; other derivation errors map to 71.
+- HwVault `get_derived_key` requests cached credential 11 (`0xb258`).
+  `get_cached_cred` returns 7 when that cache entry is absent (`0xb054–0xb0a4`).
+- HwVault `VERIFY_GET` returns status zero and credential bytes even if its
+  internal `set_cached_cred` call fails: the handler ignores that return code
+  at `0x9c18–0x9c1c`. The previous success check therefore gave a false positive.
+- The existing One UI trace verifies persistent indices 0/1 with
+  `HV_TAG_UPDATE_CRED=1`, and ordinary index 11 with zero. Ubuntu incorrectly
+  always sent zero. Correcting this gives confirmed cache status zero for 0/1,
+  but does **not** fix index 11.
+- The firmware's textual diagnostic TLVs (`0x02002710`) explicitly report
+  `strongbox_unwrap err -64`, then index-11 cache status **9936**, while outer
+  verification remains zero. Android defines -64 as
+  [`KEYMASTER_NOT_CONFIGURED`](https://android.googlesource.com/platform/hardware/interfaces/+/57b63bd35606007d7f97d2b2098aec2d150859a4/keymaster/4.0/types.hal).
+
+`gts9u38` corrects the namespace flag and fails early unless each authenticated
+GET has a matching successful cache acknowledgement. The check parses only
+bounded status/log TLVs; it never exports credentials, keys or biometric bytes.
+It is an error-detection guard, **not a StrongBox initialization fix**, and still
+requires a successful encrypted EnrollDo before saving a print. There are 21 new
+synthetic restore tests in addition to the existing 11 encrypted-wire tests.
+
+The full ARM64 package build passed all 32 tests; the 21 restore cases also pass
+UndefinedBehaviorSanitizer. Installed package SHA-256:
+`34f190026cabedbe851bff94988d83dd343fe7c660f6007551f4e7f0b8247f9e`.
+The previous `gts9u37` package is retained and hash-verified on the tablet.
+An actual systemd/fprintd `Claim` now rejects the known failure with explicit
+cache status 9936 before enrollment starts. Sensor power and FOD HBM both return
+to zero. This check does not start a capture, overwrite the user's test log,
+write secure-element credentials or reboot the tablet.
+
+The next functional work is the missing StrongBox/Keymaster initialization and
+wrapped-root restore sequence, including the stock `SET_HWVAULT_ROT` step after
+the authenticated GET. A successful GET or BAUTH Prepare is not sufficient
+validation. No new root should be generated, no secure credential should be
+replaced, and no fingerprint/Android credential should be imported. Keep the
+working illumination and capture behavior unchanged while fixing this boundary.
+
+The overall estimate remains approximately **80%**, highly uncertain: physical
+capture improved materially, but encryption was previously overestimated and
+matching/lock-screen use remain untested. No Android boot is needed for this
+diagnosis; the reference logs and signed firmware are already available locally.
+
+## Resident Keymaster lookup ABI (2026-09-02)
+
+`gts9u39` fixes QSEECom `lookupTA` (loader UID 122, operation 2). Its ABI is
+one input buffer, **one 32-bit architecture output and one object output**
+(counts `0x1011`). Omitting the scalar output sent `0x1001`, rejected with
+INVALID before looking up the name. This was incorrectly treated as a missing
+TA, causing unnecessary load attempts and hiding the resident Qualcomm
+`keymaster64` controller. The loader/unloader still unloads only TAs it actually
+loaded; borrowing a resident controller must not unload another client's TA.
+
+The corrected lookup finds `keymaster64`, architecture 2. Its read-only
+`0x200` response is API **4.1**, TA **4.1012**, matching the saved One UI boot
+trace. Normal-world access to services 150/296 is restricted and is not a
+substitute for the app-loader controller. Samsung `skeymast` is a different TA;
+configuring it alone does not configure Qualcomm StrongBox.
+
+Six mocked invocation tests cover the ABI for four TA names, a missing TA and
+transport failure. The full ARM64 build passes all **38 offline tests**.
+Installed package SHA-256:
+`2f99d9066b81a7e44348e6852e3c9fe7c081016be7738c2107621be47ef99dfa`.
+The previous `gts9u38` package is retained and hash-verified on the tablet.
+
+A real systemd/fprintd `Claim` still fails early at the encryption preflight
+(cache status 9998 in the diagnostic SPU session), without starting enrollment.
+This package is an ABI correction, **not an enrollment fix**. The user should
+not repeat a 17-touch enrollment until credential 11 has a positive cache
+acknowledgement. The capture/HBM settings and the user's test logs are unchanged.
+
+## SPU configuration and real interrupts (2026-09-02)
+
+Non-biometric Ubuntu diagnostics have advanced the failure boundary. No
+fingerprint, PIN, new root, key-generation command or secure credential PUT was
+used. The Ubuntu boot image remains the previously verified `5269f2fd…744b`;
+only an Ubuntu-to-Ubuntu reboot was used to clear an earlier incomplete session.
+Android was not booted. The SPU daemons use Ubuntu-private NVM backing files,
+backed up before startup; Android filesystems are not mounted for these tests.
+
+`sec_nvm` and `spdaemon` started together through the real `/dev/spss_utils`
+events. `sp_keymaster` reports **v73.6.FE7DA67B**, hardware **06010000**, the same
+as the saved One UI trace. No fabricated event proxy was needed.
+
+The resident Qualcomm controller accepts:
+
+- `0x200`: API 4.1 / TA 4.1012, read-only version query.
+- `0x20d`: a 20 KiB control DMA buffer allocated from `qcom,secure-sp-tz`,
+  registered with QTEE and locked through SPCOM's `sp_keymaster` channel.
+  The diagnostic retains the DMA lease until an Ubuntu reboot; stopping its
+  process while secure world might retain the address is not a safe cleanup.
+- `0x207`: the stock 24-byte protocol negotiation request, status zero.
+- `0x2116`: modern CBOR Configure with the three required OS/patch tags. Ubuntu
+  uses zero values rather than claiming an Android security patch level.
+  Legacy `0x116` and optional SetVersion `0x3121` return -40; stock's modern
+  Configure path ignores SetVersion's failure and continues.
+
+After configuration, the cache failure changes from 9936 (`-64`, not configured)
+to 9998 (`-2`) with no working interrupt listener. The formerly stubbed listener
+was a second independent omission:
+
+- Service 87 / listener `0xb000` uses **SPL's raw protocol**, not libqisl's TLVs.
+  Requests are `{command, unused, timeout_ms}` and replies `{command, status}`.
+- Unknown commands, including the initial `0xdead`, receive `0xff`, as in stock.
+  `0x777` waits for `/dev/qsee_ipc_irq_spss`. Replies distinguish actual IRQ
+  (`0xaa`), timeout (`0xbb`), reset (`0xcc`), cancellation (`0xdd`) and I/O error
+  (`0xee`). Registration or elapsed time must never fabricate an IRQ.
+- The QTEE callback has two output buffers (16-byte offsets / 4-byte flag) and
+  four output objects. Callback outputs have capacities but initially NULL
+  addresses. Their backing storage must outlive dispatch until SUPPL_SEND;
+  the diagnostic now uses callback-owned storage and returns no objects.
+- A root-only, exclusive-open kernel bridge maps the stock IPCC **16:1 rising
+  edge**, separate from GLINK's 16:0. It loaded with the existing kernel signature,
+  and both `/proc/interrupts` and the userspace poll observed real interrupts.
+
+The reusable listener dispatcher is included in `gts9u40` but remains behind
+`EL721_QIS_DIAGNOSTIC=1`; neither the module nor the SPU initializer is enabled
+automatically. The bridge lacks subsystem-reset reporting, and diagnostic waits
+are capped at five seconds. These limitations are explicit, not silently treated
+as successful hardware events. See
+[`kernel/modules/spss-irq/README.md`](../kernel/modules/spss-irq/README.md).
+
+Twenty-five synthetic SPL tests cover callback shapes, output-buffer lifetime,
+raw replies, malformed requests, unknown commands, and timeout forwarding. They
+pass UndefinedBehaviorSanitizer; kernel checkpatch reports zero errors/warnings.
+The integrated dispatcher was also exercised on the tablet without enabling the
+sensor or illumination. It receives two genuine IRQs and returns both to QTEE.
+
+**Failure in that already-partially-initialized boot:** with this listener, HwVault reports
+`strongbox_unwrap err -40` and cache status **9960**, despite successful outer GET
+verification. Configuring Samsung `skeymast` as well does not change it. The
+signed Qualcomm TA's command table does contain legacy `SB_UNWRAP` (`0x51b`),
+forwarded through SPU initialization/transport; the evidence does not establish
+that unwrap itself, rather than a prerequisite, rejects the request. This is the
+next boundary to investigate. Encrypted enrollment and verification are still
+unproven, and another physical enrollment test is not yet useful.
+
+The complete ARM64 `gts9u40` build passes **63 offline tests** (11 enrollment,
+21 HwVault, 6 lookup, 25 SPL). Installed package SHA-256:
+`1c99440eec266792bfa84958f9bb430a1bde689d580a79e55321782d941ced11`.
+The corrected final SPL header also rebuilds without driver warnings under
+libfprint's stricter `-Wswitch-enum` flags. The normal systemd/fprintd `Claim`
+retains the explicit early failure (9998 without the diagnostic listener),
+instead of asking for samples and failing at the end. Prior packages remain
+available for rollback. No new physical enrollment is claimed.
+
+The standalone module's final source builds and signs successfully; its
+SHA-256 is `803c3b504be4ab151ed011ab77ec66da561e55cd4fd05d90231b04a28e919653`.
+Only comment formatting differs from the module exercised on the tablet.
+
+## Clean, listener-first startup restores the encryption credential (2026-09-02)
+
+A subsequent controlled Ubuntu-to-Ubuntu reboot removed the incomplete SPU
+session. With the SPL listener registered **before the first SPU-backed crypto
+request**, all three authenticated HwVault restores now report an explicit
+successful `set_cached_cred` acknowledgement, including ordinary credential
+**11** (`persistent=0`, `ret=0`). The previous 9960 failure is absent. The final
+signed IRQ module described above is the one exercised in this boot.
+
+The working diagnostic order is:
+
+1. Start Ubuntu's `sec_nvm` and `spdaemon` together and wait for SP applications.
+2. Load the IRQ bridge and register the real SPL listener, retaining its owner.
+3. Look up resident `keymaster64`; query `0x200`, negotiate with the stock
+   24-byte `0x207`, and bind/retain the 20 KiB DMA buffer with `0x20d`.
+4. Send the stock date-support query and optional SetVersion, then modern
+   Configure with the existing conservative zero OS/patch tags.
+5. Restore HwVault credentials 0/1/11 and require positive cache acknowledgements.
+
+The IRQ bridge may be loaded before starting the SPU daemons; the important
+ordering is that the listener must be ready before deferred crypto initialization.
+The successful first restore generated multiple genuine SPL interrupts, unlike
+the two-interrupt failure in the incomplete session. Static analysis shows that
+normal-world `0x20d` only binds the buffer; the first SPU-backed operation performs
+additional initialization. A partially completed exchange explains the observed
+order dependence, but the precise remote failure state has not been proven.
+
+Two actual systemd/fprintd `Claim` calls succeeded with `gts9u40`, including one
+after restarting fprintd. The independent listener/DMA owner remained running;
+the driver could borrow HwVault and restore its cache across service lifetimes.
+After release, sensor power, panel FOD mode and touch FOD enable were all zero.
+No enrollment was started and the previous physical-test JSONL was unchanged.
+
+**A new physical enrollment test is now useful.** Success still requires an
+encrypted template and `enroll-completed`, not just 17 accepted samples or a
+successful Claim. Same/different-finger verification, production startup/reset
+handling and lock-screen integration remain outstanding. The overall estimate
+is approximately **85%**, with substantial uncertainty until those tests pass.
+
+This is a prepared diagnostic session, not persistent boot integration. The
+transient listener/DMA owner must remain alive until a controlled Ubuntu reboot;
+do not kill it, unload SPSS or start a second initializer. After a reboot the
+ordered setup must be repeated before asking the user to enroll. No Android boot,
+new HwVault root, secure credential PUT or Android-private-state import was used.
+
+## First encrypted enrollment and persisted identity fix (2026-09-02)
+
+The next physical test completed at 19:14:09 UTC: **17 accepted samples, 100%
+coverage, five quality retries**, and an **847,142-byte encrypted template**.
+The client reported `enroll-completed`, and a separate `fprintd-list` confirmed
+the right-index print on disk. Sensor power and both FOD controls returned to
+zero. This establishes encrypted enrollment, not successful recognition.
+
+A subsequent bounded, no-finger verification failed at `IdentifyInit` with 31.
+The stored blob has the expected `FPV32000` header and matching big-endian length;
+its contents were not exported or decrypted outside the TA. Review exposed a
+separate driver defect: `fpi_print_generate_user_id()` returns a fresh random ID
+on every call. The driver called it for every enrollment transaction and again
+for verification, and stored only `(uay)` (slot, ciphertext). The signed TA
+compares the supplied 256-byte identity against the identity in the decrypted
+template (`decode_each_templ_ver3`, comparison at `0x13260–0x132b0`). Regenerating
+the identifier cannot reproduce that identity.
+
+`gts9u41` generates the enrollment ID once, retains it through all captures,
+stores `(suay)` (identity, slot, ciphertext), and loads the saved ID for matching.
+It explicitly rejects legacy prints that have no saved ID, requesting enrollment
+again; it does not bypass the TA comparison or invent an identity. Mixed-identity
+galleries are rejected rather than submitted under the first print's identity;
+multi-print identification remains integration work. The first test is therefore
+one new enrollment, followed by same-finger and different-finger verification.
+Successful recognition after this correction still needs physical validation.
+
+Ten offline tests cover persisted identity roundtrip, backing-storage lifetime,
+legacy rejection and size/slot validation, alongside the previous 63 protocol
+tests. Tab Companion 1.1.5 adds an explicit verification mode, preserving the
+saved print and distinguishing a non-match from a transport/reader error.
+Sixteen offline client tests cover status parsing, retries, cancellation,
+timeout and late delivery of the final result. Zero process exit status alone
+is never counted as a successful verification.
+
+All **73** offline driver tests pass with UBSan and strict enum warnings; the
+ARM64 incremental build passed without compiler warnings. The installed
+gts9u41 package SHA-256 is
+`3643f752873f065e164b0f394c6809c0689a2a3a16ec94f77970177d6413d8ae`.
+An installed-device check confirms explicit legacy rejection before illumination,
+with all three sensor/FOD controls idle afterward. The old encrypted print was
+backed up with root-only permissions and remained byte-for-byte unchanged during
+deployment. No new physical test is claimed here. The live SPU owner was retained.
+
+## Verification waits for contact, not a byte-12 false rejection (2026-09-02)
+
+The user re-enrolled with `gts9u41`: 17 accepted samples, 100% coverage and an
+848,262-byte encrypted template, with successful EnrollDo/Final. IdentifyInit
+now accepts the persisted identity. However, verification returned terminal
+`verify-no-match` about 177 ms after starting, before any physical contact.
+
+The independent bounded no-contact probe and the signed TA's `run_identify_do`
+agree on the cause: IdentifyDo's next operation is at byte **0**, not byte 12.
+The initial words `{4, 0, 0xffffffff, 0, 0, 0}` mean **wait for contact**, not
+completion. Byte 16 is the score and byte **20** the matched slot; exchanging
+those also prevented reliable match reporting. The decoder now handles this
+layout separately, bounds opaque updates and copies them only for a completed
+successful match. It never treats an update or score alone as authentication.
+
+`gts9u42` arms IdentifyDo once, requires operation 4, then waits for a fresh
+physical PRESS edge. Held contact and RELEASE cannot initiate extra captures.
+A bounded synchronous stock-style capture sequence follows the press; Final
+must succeed before reporting a match. Quality retries reinitialize and rearm
+the transaction for another press. The existing 90-second inactivity watchdog
+and cancellation remain in effect; no timeout was artificially extended to
+conceal the decoder defect.
+
+Thirty synthetic IdentifyDo/contact tests cover the observed wait regression,
+slot versus score, auxiliary versus operation fields, retries, no-match,
+malformed buffers, update ownership/bounds and all contact-gating combinations.
+All **103** driver tests pass with UBSan and strict enum warnings; the ARM64
+build has no compiler warnings. The 16 Companion tests still pass. Installed
+package SHA-256:
+`eca9a15dce248619dad0bd3f39915b4d2c5f95db712542c3e748e09080415a73`.
+
+Two real fprintd verification sessions, including one after restarting only
+fprintd, each waited **over 20 seconds without contact or any rejection**.
+Sensor power, panel FOD and touch FOD remained enabled throughout, and all
+returned to zero after VerifyStop/Release. The newly enrolled print was backed
+up root-only and remained byte-for-byte unchanged; Companion's physical-test
+log was not overwritten. The temporary debug override was removed and the
+independent SPU listener/DMA owner was retained without a reboot.
+
+Next physical test: Companion Info → **Verificar huella guardada** → start,
+then use the enrolled finger. If it matches, repeat using a different finger
+and require rejection. No re-enrollment is needed. **Recognition is not yet
+validated**; the overall estimate remains roughly 90%, with persistent startup,
+same/different-finger validation and lock-screen/UX integration outstanding.
+
+## Recognition confirmed and first GNOME integration (2026-09-02)
+
+The physical tests at 20:44–20:45 UTC confirm three matches with result/final
+0/0 and slot 3, and four rejected attempts with result/final 32/0 and slot 0.
+The user identifies these as the enrolled finger versus other fingers. All
+captures followed actual PRESS edges. This is functional evidence on this
+device, not a statistical false-accept/reject evaluation.
+
+`gts9u43` reports the terminal **32 + operation 0 + slot 0** tuple as an ordinary
+non-match (`FPI_MATCH_FAIL`), not `verify-unknown-error`. IdentifyFinal must still
+succeed first. Other secure errors, retries, intermediate operations and
+contradictory nonzero slots are not reclassified. Eight new synthetic cases
+raise the driver suite to **111 passing tests**, with UBSan/strict enum warnings;
+the ARM64 build is warning-free. Companion's 16 tests also pass. Installed
+package SHA-256:
+`53547a9e7276868cbc0c77af1df2806aea1334ae424ff09befe72d1bd73a9566`.
+A post-install no-contact verification waited 20.249 seconds and cancelled
+cleanly. The new rejection wording still needs a physical different-finger test.
+
+The installed GNOME/GDM configuration already enables both fingerprint and
+password authentication. `/etc/pam.d/gdm-fingerprint` uses `pam_fprintd.so`, while
+`gdm-password` and `common-auth` retain the separate password path. All three
+files remained byte-for-byte unchanged during this update. No broad PAM
+modification or fingerprint-only login policy was introduced.
+
+Device package **2.39**, overlay **8**, removes the accelerometer dependency.
+It asynchronously reads Mutter's applied DisplayConfig transform and selects
+the built-in `DSI-1`, not whichever external display is primary. Thirty-six
+offline geometry cases cover all eight transforms at three scales, invalid
+inputs, panel selection and monitor offsets. The shade is non-reactive and
+excluded from the input region; only the target retains its touch guard.
+Package SHA-256:
+`6a3c3cd05d91f739c1eb56632174fd163a5523ed3f4c8b84eecc73802649d2be`.
+
+These geometry changes are installed on disk but **require a GNOME logout/login
+to load**, because imported extension modules remain cached. No logout/reboot
+was forced. At **21:16:16 UTC**, the user instead successfully unlocked the
+existing GNOME session using the enrolled finger. The journal identifies
+gnome-shell as the activating client, a successful secure match and the
+`gdm-fingerprint` PAM conversation; logind then reports the session unlocked.
+Companion's previous test log is unchanged, so this was a native system unlock,
+not an app test. It used the new gts9u43 driver but the still-cached v7 overlay.
+Native GNOME also logged a disposed UserVerifierProxy warning afterward, worth
+checking on repeated locks; this does not invalidate the observed unlock.
+The next tests are a logout/password login to load v8, then landscape screen
+lock, wrong-finger rejection, password fallback and repeated unlocks. Native
+GNOME handles the PAM feedback; this first step does not add near-sensor text.
+
+Remaining work is explicit: illuminate only during contact (dim icon at rest),
+coordinate keyboard overlap with the driver's touch suppression, validate actual
+rotations and suspend, provide the target in GDM's separate greeter session,
+and replace the transient SPU setup with a safe production startup/reset path.
+Merely hiding a target over the keyboard is insufficient: the kernel currently
+suppresses ordinary touches inside the enabled FOD rectangle. No UI workaround
+claims that interaction is solved yet. The saved print and the live SPU owner
+were preserved; no new enrollment is required.
+
+Implementation references: [Mutter 46 input transform matrices](https://github.com/GNOME/mutter/blob/46.0/src/backends/meta-monitor-manager.c),
+[DisplayConfig applied transforms](https://github.com/GNOME/mutter/blob/46.0/data/dbus-interfaces/org.gnome.Mutter.DisplayConfig.xml),
+[GNOME 46 extension module caching](https://github.com/GNOME/gnome-shell/blob/46.0/js/ui/extensionSystem.js),
+[native GNOME authentication feedback](https://github.com/GNOME/gnome-shell/blob/46.0/js/gdm/util.js).
+
+## Repeated-unlock closed connection and retry lifecycle (2026-09-02)
+
+After logging in again, overlay **8** was confirmed active. Native unlock then
+accepted the enrolled finger, rejected other fingers twice with secure result
+32, and accepted the enrolled finger again. Subsequent repeated lock/resume
+attempts left the unlock prompt unusable, while quick settings, volume and SSH
+still responded. At inspection, fprintd was inactive, sensor power/FOD/touch
+FOD were all zero and the overlay's Visible property was false.
+
+The installed Ubuntu GNOME code identifies the immediate UI failure: each
+`UnlockDialog._ensureAuthPrompt()` reset calls `ShellUserVerifier.cancel()`,
+whose synchronous cancellation throws **Gio.IOErrorEnum.CLOSED** before
+`clear()` runs. The stale verifier is therefore retained and every new gesture
+throws again. This is not evidence of a GPU or secure-processor hang. The
+preflight still succeeded after the suspensions without enabling illumination.
+
+Device **2.40**, overlay **9**, adds a narrow cancellation guard to the existing
+extension. It delegates to GNOME's original cancel method; only a CLOSED error
+with a demonstrably closed verifier connection triggers GNOME's own `clear()`.
+Other errors propagate. It never reports authentication success, unlocks the
+session or changes PAM policy. Disabling the extension restores the original
+method if its wrapper still owns it. Seven offline cases and a real private
+GJS/GIO closed-connection test pass. The running v8 session still needs a
+logout/login before the guard is active; recovery of the real stuck dialog is
+**not yet validated**.
+
+A separate driver contract violation was also found in the earlier greeter
+quality retries: `fpi_device_verify_report` asserted because the driver tried
+to report multiple results for one action. libfprint requires report **then
+complete**, even for retry errors. `gts9u44` powers down/cleans up that action,
+reports one retry and completes it with NULL completion error. fprintd owns the
+next action, instead of the driver silently rearming the already-reported one.
+Two stubbed notification-lifecycle tests exercise five consecutive actions each
+for Verify and Identify, bringing the C suite to **113 passes** with UBSan.
+The 36 geometry and 16 Companion cases also still pass. Physical repeated
+quality retries and repeated lock/suspend remain required tests.
+
+Installed SHA-256 values:
+
+- libfprint gts9u44: `3140de81227db20e43e066f317ddac3c270e51178eb6f92ee90254ab9b633b0f`.
+- Device 2.40: `ce06a231c2e86c2c8528c5c2033d444f516720a01fb17a58e44990c0861c2c35`.
+
+For non-destructive recovery, a new GDM greeter was opened using its normal
+CreateTransientDisplay interface, leaving the original session locked and its
+applications running. It still requires the user's password; no unlock signal
+or authentication bypass was used. No reboot, GDM restart or SPU-owner restart
+was performed. The saved print and three PAM files remained byte-for-byte
+unchanged. This regression means repeat-unlock stability must not be described
+as complete despite the earlier successful single unlocks.
+
+## Touch-to-light icon and repeated-unlock validation (2026-09-03)
+
+The user returned to the desktop, logged in again, and the running extension
+was confirmed **v9 ACTIVE**. They subsequently report repeated successful
+tests in several rotations, without recurrence of the stuck prompt. This is
+useful physical validation of the applied-transform positioning and repeated
+unlock path, not a claim of exhaustive suspend/reset reliability.
+
+**gts9u45 + device 2.41 / overlay 10** implement the requested resting icon:
+
+- Arming enables the sensor and Goodix contact detection but leaves panel
+  `fod_mode=0`. A root-owned `/run/gts9u-fingerprint/active` lease tells Shell
+  to display the installed `auth-fingerprint-symbolic` icon. It contains only
+  an expiry time, never an identity, template or authentication result.
+- The lease is renewed every second, expires after three seconds and is
+  removed by normal action cleanup and fprintd's stop/crash cleanup. Its
+  directory is root-writable (0755), the file publicly readable (0644).
+  No writable sysfs permissions or authentication policy are loosened.
+- A real Goodix PRESS enables optical HBM; Shell replaces the icon with the
+  white circle and compensation shade. Normal touch/click events are not
+  required, because the controller suppresses them in the sensing region.
+- Capture waits **at least 180 ms after the panel command completes**. The
+  nonblocking timer leaves cancellation responsive while allowing the 50 ms
+  Shell observer and compositor frames to present the target. This is a
+  conservative settling interval, **not a compositor-ready acknowledgement**;
+  physical capture quality under load still needs validation.
+- Early release cancels the pending capture and turns off HBM. Completed
+  enrollment samples also turn it off before waiting for the next press;
+  holding a finger cannot trigger another sample. Verify completion/retry,
+  cancellation and errors use the existing full cleanup path. If suspend has
+  disabled Goodix FOD, the action ends instead of silently rearming it.
+- The waiting icon uses the same already-tested physical geometry. The shade
+  is hidden while waiting, including if Shell tries to remap top-chrome actors.
+  Actual panel HBM remains authoritative for compensation, including with an
+  older driver, so a stale lease cannot leave a permanently shaded desktop.
+
+Validation: **120 C tests** pass under UBSan, plus 36 geometry, seven closed-GDM
+recovery, 13 visual lease, seven mocked overlay transition and 16 Companion
+tests. The ARM64 build completed without warnings. Mock actor tests validate
+state transitions, not actual rendering. After installation, a no-contact
+hardware verification waited **20.708 seconds** with sensor/panel-FOD/touch-FOD
+`1/0/1`, no results and a continuously fresh lease. Cancellation restored
+`0/0/0` and removed the lease. The saved print and all three PAM files remained
+unchanged; the existing SPU owner was preserved. The new extension still needs a
+logout/password login to replace GNOME's cached v9 module before physical
+icon/capture testing. No new enrollment is required.
+
+Package SHA-256 values:
+
+- libfprint gts9u45: `3aaebc51064929d0697eeb76c6b985ae5f8fe700b86f8a399a01f3cea111a786`.
+- Device 2.41: `4c26f297394c865555e261472ea1b37e446bc1622a9297551e3143b435f84867`.
+
+This does **not** yet supply an overlay in GDM's separate initial-login greeter,
+coordinate the on-screen keyboard with touch suppression, add near-sensor
+error text, or replace the diagnostic SPU owner with production boot handling.
+Use the password for the initial login; then test the icon in Companion and
+the session lock screen. No reboot or SPU-owner restart is needed or performed.
+
+## Keyboard inhibition and GDM integration (2026-09-03)
+
+The user confirmed that the resting-icon/touch-to-light change works; the
+running **v10 ACTIVE** was verified before proceeding. **gts9u46 + device 2.42 /
+overlay 11** now implement the next integration checkpoint. The package requires
+at least driver gts9u46: an older driver would hide the icon but still suppress
+keyboard touches, which is not a valid partial upgrade.
+
+### Availability and keyboard safety
+
+Shell reserves the keyboard's final rectangle as soon as it starts showing,
+and throughout its hide animation. Geometry uses the same applied monitor
+transform as the target; it never moves the target away from the physical
+sensor. When the keyboard overlaps, the target and nearby feedback are hidden.
+
+A small root system-bus service, `ubuntu-gts9u-fingerprint-ui`, publishes a
+two-second availability lease under `/run/gts9u-fingerprint-ui/ready`. It accepts
+`Pulse(sessionId, available)` only when the sender UID belongs to the requested
+active local graphical session on seat0, including GDM's greeter. It checks
+logind again while the lease is live and drops it on expiry, session change,
+or the publishing bus connection closing. NameOwnerChanged is accepted only
+from the bus daemon. Inactive Shell sessions do not send pulses. The service
+cannot access hardware, templates, PAM or authentication results; its only
+effect is allowing/pausing optical capture. Root is not an implicit exception
+to the active-session check. Active-user applications could also pause capture;
+this channel is an availability aid, never an authentication authority.
+
+The driver publishes its operation status independently so the UI can resume
+a paused operation. Without a valid ready lease it turns **both panel HBM and
+Goodix FOD off**, preserving the normal touchscreen. When the UI becomes ready,
+it re-enables contact detection and seeds the contact sequence/latch before
+waiting again. Missing/unloaded Shell integration deliberately leaves capture
+paused; password authentication is untouched. Cancellation and the existing
+action timeout remain in force. A secure capture already executing synchronously
+must return before the driver can process another pause; this update does not
+make the TA call itself asynchronous.
+
+### GDM and error feedback
+
+The extension declares the `gdm` session mode. A separate vendor keyfile in
+`/usr/share/gdm/dconf/91-gts9u-fingerprint` enables just this system extension
+for the greeter. Ubuntu's existing `generate-config` recompiles the existing
+profile/defaults; no GDM restart, logout, replacement profile or PAM edits are
+performed by the package. Reading the effective GDM settings confirmed the
+fingerprint extension enabled and `disable-user-extensions=false`. This follows
+the installed Ubuntu GDM layout, together with GNOME's documented
+[extension defaults](https://help.gnome.org/system-admin-guide/extensions-enable.html)
+and [greeter dconf configuration](https://help.gnome.org/system-admin-guide/login-logo.html).
+
+The overlay also mirrors native, localized `gdm-fingerprint` error messages
+above the physical target for four seconds. It observes the native verifier's
+`show-message` signal; it never answers or completes authentication, and ignores
+password messages. Text follows the displayed UI orientation and disappears
+when the keyboard covers the sensor or the native prompt is destroyed.
+
+### Validation and next physical checkpoint
+
+- **136 C cases** pass with UBSan, plus 75 keyboard geometry, 12 mocked overlay
+  transition, five native-feedback observation, eight broker policy, 36 sensor
+  geometry, 13 visual lease, seven auth recovery and 16 Companion tests.
+- ARM64 compilation passed without warnings. Both packages were installed,
+  with unchanged saved-print/PAM checks and the same live SPU and GDM processes.
+- A bounded no-contact hardware test exercised missing UI, blocked UI, ready UI,
+  keyboard appearing/dismissed, heartbeat expiry/restoration and client
+  disconnection. Every paused state was sensor/panel-FOD/touch-FOD **1/0/0**;
+  every ready state **1/0/1**. No verification result or HBM was produced.
+  Cancellation restored **0/0/0** and removed the operation lease. A root caller
+  could not impersonate the active user; a user caller supplying a different
+  session was rejected. The root-owned lease was readable by the ordinary user.
+- The first probe was interrupted by a contact release/new press at the sensor,
+  which correctly enabled HBM. After coordination with the user, the complete
+  no-contact sequence above passed. This is distinct from an actual keyboard
+  or greeter rendering test.
+
+Installed SHA-256:
+
+- libfprint gts9u46: `11051657db1ece983e8aafd7ba66928636b6960d8ca81610470f6657d76ecdcc`.
+- Device 2.42: `3a2879ce06ecfef95087a14aec8ec049034f32f0e1081281d1bdf7bd2f5fbf80`.
+
+The running user Shell still caches v10 until a **logout/login**, not just a
+screen lock. Physical validation must check the new GDM icon/recognition,
+portrait keyboard typing at the former overlap, return of the icon after
+dismissing the keyboard, and wrong-finger feedback. Password remains the
+fallback. Do not call those paths proven based only on the broker probe.
+
+After that checkpoint: back up the existing print and validate registration,
+retry feedback, cancellation, removal/re-registration and recognition using
+GNOME Settings from scratch. The final separate task is production SPU startup
+and a controlled Ubuntu reboot; the diagnostic DMA/listener owner is still
+required and must not be restarted independently. The overall estimate remains
+approximately **94%**, pending real UI and cold-start validation.
+
+## Authentication keyboard and passive overlay (2026-09-03)
+
+The user physically validated **GDM fingerprint login**, hiding the portrait
+target when the native keyboard covers it, and successful fingerprint use after
+dismissing that keyboard. Two regressions remain: one GDM login left the desktop
+unresponsive to touch, and the lock-screen keyboard did not open automatically
+without the cover unless accessibility forced it on.
+
+Read-only inspection after the report found sensor power, panel FOD and touch
+FOD all zero, no operation lease, zero active multitouch slots and a hidden
+overlay. The active user Shell held the touch device; the inactive GDM Shell
+did not. No relevant touch-controller or extension exception was found in the
+examined interval. **This does not establish the cause of the intermittent
+failure.** The user subsequently confirmed that multi-finger gestures still
+worked while single-finger touches did not. A passive touch-only observation
+received 1,462 frames; disabling the overlay and briefly switching away from
+the graphical VT and back did not restore single touch. All physical touch
+slots were idle afterward, and the pen was not in proximity. With the user's
+approval, a normal logout/login recovered single touch. **This demonstrates
+recovery after restarting GNOME, not a permanent fix or the triggering cause.**
+No controller reset, Ubuntu reboot, Android boot, SPU restart or auth-grab removal
+was performed.
+
+The installed Ubuntu GNOME 46 KeyboardManager requires both seat touch mode and
+a last-device touchscreen hint for automatic OSK activation. Goodix consumes
+fingerprint contacts before Mutter, so a fingerprint touch cannot provide that
+hint. The initial **device 2.43 / overlay 12** live diagnostic also found
+`touchMode=false` and `physicalKeyboard=false` despite the attached cover being
+present in sysfs. A compositor-only inventory is insufficient when Companion
+grabs/forwards the cover. **Device 2.44 / overlay 13** therefore adds a narrowly
+scoped fallback to the existing native keyboard policy:
+
+- Only an active local authentication screen on the tablet's recognized panel
+  without a physical typing keyboard gets the additional enable predicate.
+  It supplements the read in KeyboardManager's own private Settings instance;
+  it never writes the accessibility preference or changes the shared Clutter
+  seat. Native automatic touch behavior and explicit accessibility remain intact.
+- Physical typing capabilities are read from sysfs, excluding only Companion's
+  identified permanent forwarding device. Power/lid keys are not keyboards;
+  Bluetooth keyboards are not excluded merely for using virtual UHID paths.
+  Unknown physical-device metadata does not force a keyboard. The complete
+  kernel inventory is refreshed on device events and once per second, including
+  real keyboards that Mutter may not expose in its own device list.
+- An already-focused text entry receives one native keyboard focus refresh on
+  activation. Polling never repeatedly opens an intentionally dismissed OSK.
+  Seat handoff, keyboard attachment and extension disable remove the fallback;
+  native authentication is neither answered nor modified.
+- A native keyboard API error restores the original hint and logs once without
+  stopping the fingerprint panel poll or availability lease.
+
+The fingerprint target is now **non-reactive** and excluded from the Shell
+input region, just like its shade and feedback. Goodix remains responsible for
+consuming sensor contacts. Showing the target no longer closes Quick Settings
+or the overview. These are defensive input-isolation changes, **not a proven
+fix for the reported whole-screen touch failure**.
+
+A read-only `GetDiagnostics` method on the existing overlay session-bus object
+reports session/lock state, native modal count, touch mode, physical-keyboard
+detection, OSK state and overlay visibility/reactivity. It exposes no entry text,
+finger images, templates, credentials or authentication answers. While the
+failure is present, collect this snapshot together with touch slots, FOD flags
+and the journal before logging out:
+
+```sh
+gdbus call --session --dest io.github.agcarbajo.Gts9uFingerprintOverlay \
+  --object-path /io/github/agcarbajo/Gts9uFingerprintOverlay \
+  --method io.github.agcarbajo.Gts9uFingerprintOverlay.GetDiagnostics
+```
+
+Validation: 48 keyboard policy/lifecycle checks; existing 75 overlap, 36 geometry,
+13 visual lease, seven cancellation recovery, 12 overlay transition, five
+feedback, eight broker and 16 Companion tests pass. Additional checks cover the
+passive target, absence of menu/overview mutations, diagnostics and keyboard
+failure isolation, plus five kernel-inventory/hotplug paths. A standalone GJS
+probe on the tablet verified required Clutter APIs, real input capability parsing
+(one attached physical keyboard), policy activation/restoration on a real
+Gio.Settings object and unchanged stored preference. These are **not live GNOME
+rendering tests**.
+
+Device 2.44 SHA-256:
+`c0df8e6f0e2cbfa503d3875ed611dae0556322ce377d0f1d14265948b906adcf`.
+The driver remains gts9u46. A fresh Shell via logout/login is required to load
+overlay 13. Deployment verified unchanged saved print/PAM files and preserved
+SPU/GDM/Shell processes. The user then authorized a fresh graphical session;
+the new GDM Shell reports **v13**, an active greeter session, **physical keyboard
+present**, no policy error and a non-reactive hidden target while idle. The
+next physical test is automatic native keyboard opening without
+the cover, manual dismissal/return of fingerprint, and repeated GDM logins with
+ordinary desktop touch afterward. Preserve a failing session for diagnostics.
+The approximately **94%** estimate is unchanged until these regressions and
+the native Settings/production-startup checkpoints are validated.
+
+## Native UI validation and targetless keyboard events (2026-09-03)
+
+The user reports that the v13 integration now works well. The corresponding
+journal shows **four secure matches and five normal non-matches**, including
+two successful fingerprint GDM logins. It also records native keyboard fallback
+activation/deactivation and reader inhibition/resumption around UI availability.
+At the final desktop snapshot there was no modal grab, keyboard-policy failure,
+visible target, operation lease or active sensor/panel/touch FOD state. The
+original SPU owner remained alive and no system service was failed.
+
+One additional GNOME exception appeared during those otherwise successful tests:
+`Argument descendant may not be null`, from KeyboardManager `maybeHandleEvent`
+at `keyboard.js:1165`, called by native modal and unlock dialogs. The installed
+GNOME implementation calls `keyboardBox.contains(actor)` without handling a
+null result from `stage.get_event_actor(event)`. This is a confirmed exception
+path, **not proof of the cause of the earlier intermittent single-touch failure**.
+
+**Device 2.45 / overlay 14** adds a reversible guard around that native keyboard
+method. With an existing keyboard but no event actor, it returns **not handled**
+so normal event propagation continues. Events with real targets retain the
+original handler, including extended keys; unrelated errors still propagate.
+It neither completes authentication nor clears grabs or injects input.
+`GetDiagnostics` gains a counter of targetless keyboard events. Ten regression
+cases cover the null-target failure, normal/extended-key dispatch, no-keyboard
+early return, unrelated failures and restoration/ownership of the method.
+All earlier geometry, UI-policy, broker and Companion tests still pass.
+
+Device 2.45 SHA-256:
+`3365084d76c144097f1dd516af7ec9eaaa3969360388ca26c2d24a1f7e3c673f`.
+The package is installed without restarting the user's working session; overlay
+14 loads on the next fresh Shell. The current successful physical tests exercised
+v13, **not the new guard**. Stored print, PAM, SPU owner and graphical processes
+are preserved by deployment checks.
+
+The engineering estimate advances to approximately **95%** with the physical UI
+confirmation. Remaining checkpoints are native GNOME Settings enrollment from
+scratch, validation of the guard and continued touch stability, and safe
+production SPU startup followed by a controlled Ubuntu-only reboot. Do not call
+the feature boot-independent while the secure DMA/listener owner is transient.
+
+## Native enrollment and independent matching identities (2026-09-03)
+
+The user successfully enrolled a second finger through GNOME Settings. The
+journal confirms 17 accepted samples, 100% coverage, a successful EnrollFinal
+and a saved 844,630-byte encrypted payload. The previous 848,262-byte payload
+remains unchanged. Lock-screen identification then failed before arming with
+`EL721 gallery has mixed identities or is too large`.
+
+This was a driver bug, not a missing GNOME overlay. Each enrollment deliberately
+uses a separately generated, persisted identity authenticated with the encrypted
+print. The old matcher required every gallery entry to have the same identity
+and concatenated their ciphertexts into one IdentifyInit request. That cannot
+work for independently enrolled prints: IdentifyInit accepts only one identity.
+Read-only metadata inspection confirmed two different identities and secure
+slots 3 and 2. No identity or biometric bytes were logged or published.
+
+**libfprint gts9u47** validates all supplied records, then imports and verifies
+each print independently using its original identity and ciphertext. Only an
+explicit secure no-match plus successful IdentifyFinal advances to the next
+entry. A match is attributed exclusively to the currently loaded entry, never
+to the first gallery print with the same slot. This also avoids ambiguity when
+different fingers map to the same one of the four secure slot numbers.
+
+The next candidate gets a fresh secure capture, not a reused image or a fabricated
+match. With the finger still down, the already-settled light remains on and the
+driver yields before capturing again. Cancellation, contact release, UI
+inhibition and watchdog checks run between candidates. If the finger lifts,
+the remaining candidate waits for a new contact. Only one terminal result is
+reported to libfprint: success for a securely matched supplied print, normal
+non-match after exhausting the gallery, or an unchanged quality retry/error.
+Encrypted records, enrollment identities and PAM configuration are not migrated
+or rewritten. Matching several stored fingers can require a longer held touch.
+
+Validation includes nine new offline tests for independent identity/payload
+lifetime, slot collisions, ten synthetic entries exceeding the aggregate TA
+packet size, sticky exhaustion, invalid data, cleanup, held/released contacts
+and cleared illumination deadlines. These and the preceding 136 C checks pass
+under UBSan; the ARM64 package builds successfully. Synthetic ten-print tests
+are not a claim of physical ten-finger validation.
+
+Package SHA-256:
+`526a5082ddbb0ef13c68642e2050ada7b52516cd0d7649d581930a5fb09bfb98`.
+Deployment backed up both prints and verified them byte-for-byte afterward,
+with unchanged PAM, SPU owner, GDM and user Shell. No reboot or logout occurred.
+Bounded live fprintd tests successfully armed the newly enrolled finger, the
+original finger and `any` mode, with a visible passive target, HBM off before
+contact, and all hardware flags/operation lease cleared on cancellation.
+Physical matching against the new two-print gallery remains the next user test.
+
+The estimate remains approximately **95%** pending that validation and the
+remaining production-startup/stability checkpoints. Native enrollment is now
+confirmed; full cold-start independence is still not claimed.
+
+## Automatic secure startup: first Ubuntu boot (2026-09-03)
+
+The user confirmed native login with the newly registered finger after loading
+overlay 14, followed by working ordinary single-finger desktop input. The
+journal confirms secure matching of the second candidate, without a mixed-gallery
+error. This closes the immediate v14 fresh-session checkpoint, not a statistical
+proof that the earlier intermittent input issue cannot recur.
+
+**Device 2.46** introduces `ubuntu-gts9u-fingerprint-secure.service`, a
+boot-lifetime supervisor and a separately compiled native secure owner. It:
+
+- Checks hashes of the owner's existing 23-file firmware/runtime set and
+  requires Ubuntu-local NVM directories, rejecting Android-mounted storage.
+  Proprietary binaries and NVM contents are not included in the public package.
+- Loads the matching signed SPSS IRQ module and transport modules, then starts
+  `sec_nvm` and `spdaemon` in the measured order. No boot image or DTB changes.
+- Registers the global SPL listener **before** Keymaster negotiation, the
+  20-KiB secure DMA binding, configuration and authenticated HwVault restore.
+  Only actual cache acknowledgement produces readiness. The optional
+  SetVersion status is handled as in the validated stock sequence; Configure
+  and credential restoration must succeed.
+- Gives fprintd a bounded readiness prerequisite with a five-second renewable
+  root-owned lease. Daemon exit, observed SPSS state loss or initialization
+  failure withdraws readiness. Password/PAM configuration is unchanged.
+- Rejects duplicate initialization and repeat attempts in the same boot,
+  disables automatic restart and refuses manual service stop. Once a DMA
+  address may have reached secure world, even an uncertain failure retains the
+  owner rather than freeing its memory and retrying.
+
+The service uses the normal full-OS shutdown path, as the previously validated
+transient owner did. It does **not** attempt a secure subsystem restart. It also
+does not use `SurviveFinalKillSignal`/the `@argv` mechanism: upstream documents
+that mechanism for initrd infrastructure, not daemons running from the root
+filesystem ([systemd shutdown guidance](https://systemd.io/ROOT_STORAGE_DAEMONS/)).
+The IRQ bridge still lacks full SSR notification; polling remoteproc state is
+not a guarantee of observing a rapid reset/recovery cycle. The existing
+device-specific static shared-heap compatibility runtime is retained and
+hash-checked, not replaced by or advertised as a generic StrongBox implementation.
+
+Fifteen offline tests cover lease validity/expiry, ownership and symlink guards,
+duplicate attempts, read-only checks, bounded failure, service lifetime policy
+and source-level protocol ordering/DMA-retention contracts. These are not
+hardware failure-injection tests. The native ARM64 build and systemd unit
+validation pass. The IRQ module is byte-identical to the already tested signed
+build. Device package SHA-256:
+`74cc0b40c65b83362bbe4459f32c085c76a9b9d06780aaf16eb9c98bdff3a66e`.
+
+Deployment backed up both enrolled prints, device-local Gatekeeper state and
+Ubuntu NVM. Byte comparisons and checksums confirmed that the prints,
+Gatekeeper state, PAM and active Ubuntu boot partition were unchanged. The
+existing secure owner was not restarted or killed during installation.
+
+With user authorization, a **normal Ubuntu-only reboot** then completed.
+The service started automatically, announced SPSS applications ready after
+about six seconds and authenticated secure-cache readiness one second later.
+The new boot has no failed system units. fprintd subsequently completed Claim
+and Release without manual secure initialization, leaving sensor power, panel
+HBM and touch FOD disabled. Both saved prints, Gatekeeper state, PAM and the
+boot partition again compare unchanged after reboot.
+
+The user then confirmed both fingerprints in the requested post-boot and
+resume tests. The journal records a secure new-print match at 03:34:53, an
+actual suspend/resume at 03:35:09–11, and old-print matches at 03:35:17 and
+03:35:40. The native owner and both SPSS daemons remained the same processes.
+All sensor/FOD flags returned to zero and there were no failed system units.
+The final package was rebuilt without a generated Python test cache; the
+runtime code did not change, and reinstalling it preserved both prints and
+the running secure owner/Shell. Test imports and packaging now exclude caches.
+
+The approximate **98%** assessment counts automatic boot initialization and
+this physical confirmation, not long-run stability or general crash-recovery
+safety. Fresh-image builders must still provide the
+validated private runtime at the manifest's documented location; this feature
+does not fetch or copy Android credentials or user biometric data.

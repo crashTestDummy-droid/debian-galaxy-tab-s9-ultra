@@ -1,0 +1,55 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	model = "Samsung GTS9UWIFI PROJECT (board-id,03)";
+	compatible = "qcom,kalama-mtp", "qcom,kalama", "qcom,mtp";
+	qcom,msm-id = <0x218 0x20000>, <0x207 0x20000>,
+			<0x207 0x10000>, <0x218 0x10000>;
+	qcom,board-id = <0x10008 0x3>;
+	dtbo-hw_rev = <0x3>;
+	dtbo-hw_rev_end = <0x20>;
+
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			/* See the board-id 00 overlay for why these inert anchors live here. */
+			soc {
+				qcom,wdt@17410000 {
+					status = "disabled";
+				};
+
+				kryo-erp {
+					status = "disabled";
+				};
+			};
+		};
+	};
+
+	fragment@1 {
+		target-path = "/firmware";
+
+		__overlay__ {
+			qcom_scm {
+				status = "disabled";
+			};
+		};
+	};
+
+	fragment@2 {
+		target-path = "/__symbols__";
+
+		__overlay__ {
+			arch_timer = "/timer";
+		};
+	};
+
+	fragment@3 {
+		target-path = "/timer";
+
+		__overlay__ {
+			phandle = <0x400>;
+		};
+	};
+};

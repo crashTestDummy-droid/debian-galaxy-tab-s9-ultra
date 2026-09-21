@@ -1,0 +1,126 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Keep the tablet-side STM32 pogo controller on Samsung's own X910 application.
+#
+# The mainline driver only speaks the V37 application.  A controller left on
+# V37 needs nothing from this script; one that has been put back to V34 —
+# something One UI or the Ubuntu Touch port appear to do with Samsung's own
+# stm32_pogo_v3 — announces no protocol ID at all and the cover is dead.
+# Restoring V37 is therefore part of making a fresh install work, not an
+# optional maintenance step, and it runs unattended.
+#
+# What makes that safe is not caution about when to write, but where the write
+# can land.  The STM32 ROM bootloader lives in system memory, cannot be erased
+# and answers on every boot; the driver programs and then re-reads all 52 KiB
+# before declaring success.  An interrupted write leaves the application
+# invalid and this unit simply completes it on the next boot.  The one thing
+# that must never happen is writing something that is not Samsung's blob, so
+# the hash is pinned and checked before anything else.
+set -eu
+
+firmware=/lib/firmware/keyboard_stm/stm32_gts9family.bin
+expected=1b48d88c23523ae205cd960e6d42725268638a15a47d8a5e52854eb01108caa3
+driver=/sys/bus/i2c/drivers/samsung-gts9u-stm32-pogo
+device=
+control=
+diagnostics=
+battery=/sys/class/power_supply/sm5714-battery
+
+[ -r "$firmware" ] || exit 0
+
+# The driver binds around four seconds into the boot, and this unit can start
+# before that.  Asserting the controller's sysfs node as a systemd condition
+# instead was what silently skipped the whole restore on one boot: a condition
+# that loses a race just marks the unit as not applicable and says nothing.
+# Waiting here is bounded, and it reports what it decided.
+attempt=0
+while [ "$attempt" -lt 15 ]; do
+	for candidate in "$driver"/*-002a; do
+		[ -e "$candidate" ] || continue
+		device=$candidate
+		control=$device/firmware_update
+		diagnostics=$device/diagnostics
+		break
+	done
+	[ -n "$control" ] && [ -w "$control" ] && break
+	attempt=$((attempt + 1))
+	sleep 1
+done
+if [ -z "$control" ] || [ ! -w "$control" ]; then
+	echo "ubuntu-gts9u-pogo: no controller after ${attempt}s; nothing to do" >&2
+	exit 0
+fi
+
+actual=$(sha256sum "$firmware" | cut -d' ' -f1)
+if [ "$actual" != "$expected" ]; then
+	echo 'ubuntu-gts9u-pogo: refusing firmware with an unexpected SHA-256' >&2
+	exit 1
+fi
+
+# The escape hatch is opt-out, not opt-in.  Requiring an opt-in was what left a
+# reinstalled system with a silent keyboard and no indication why.
+if [ "${GTS9U_ALLOW_POGO_FLASH:-YES}" = NO ]; then
+	echo 'ubuntu-gts9u-pogo: writes disabled by GTS9U_ALLOW_POGO_FLASH=NO' >&2
+	exit 0
+fi
+
+# The cover does not have to be attached.  Measured with it detached and
+# pogo_vddo disabled: the ROM bootloader still answered with its product id and
+# flash version, because the rail that gets cut feeds the keyboard while the
+# controller sits on the tablet's own I2C6.  So there is nothing to wait for,
+# and a controller found on V34 is repaired on the first boot after an install
+# whether or not the owner has the cover in their hands.
+state=$(cat "$diagnostics" 2>/dev/null || echo)
+case "$state" in
+*flash_version=00370037*)
+	echo 'ubuntu-gts9u-pogo: controller already on V37' >&2
+	exit 0
+	;;
+'')
+	echo 'ubuntu-gts9u-pogo: no controller to talk to; nothing to do' >&2
+	exit 0
+	;;
+esac
+
+# Kernels before the version was exported cannot be asked what the controller
+# runs.  The driver still refuses to write a controller that is already on V37,
+# so the write stays correct; only the confirmation below has to be skipped
+# rather than reported as a failure.
+reports_version=no
+case "$state" in
+*flash_version=*)
+	reports_version=yes
+	;;
+esac
+
+# Programming and verifying 52 KiB over the bootloader's I2C link takes about
+# sixteen seconds, and an interrupted write is completed on the next boot
+# because the ROM bootloader cannot be erased.  So this threshold is not
+# protecting the flash; it only avoids starting the job on a tablet that is
+# about to die mid-boot.  It used to be 50 % plus an external supply, which in
+# practice meant the restore never ran at all.
+capacity=$(cat "$battery/capacity" 2>/dev/null || echo 0)
+status=$(cat "$battery/status" 2>/dev/null || echo Unknown)
+if [ "$capacity" -lt 15 ]; then
+	echo "ubuntu-gts9u-pogo: deferred to the next boot (battery=$capacity%, status=$status)" >&2
+	exit 0
+fi
+
+echo "ubuntu-gts9u-pogo: restoring the V37 application (battery=$capacity%, status=$status)" >&2
+printf '1\n' > "$control"
+
+if [ "$reports_version" = no ]; then
+	echo 'ubuntu-gts9u-pogo: write accepted; this kernel does not report the version' >&2
+	exit 0
+fi
+
+state=$(cat "$diagnostics" 2>/dev/null || echo)
+case "$state" in
+*flash_version=00370037*)
+	echo 'ubuntu-gts9u-pogo: controller is on V37 and verified' >&2
+	;;
+*)
+	echo "ubuntu-gts9u-pogo: the controller did not report V37 after the write: $state" >&2
+	exit 1
+	;;
+esac

@@ -1,0 +1,194 @@
+#!/bin/sh
+# Bind the device services that need a desktop user to whichever account the
+# owner created, at every boot.
+#
+# The image ships with no account: it is created in the first-boot wizard, so
+# nothing can be baked in at build time.  Two things depend on knowing it:
+#
+#   * group membership.  The wizard creates an administrator, which on Ubuntu
+#     means `sudo`, `adm`, `plugdev` and `users` — and nothing else.  The
+#     account the build used to create was also in the device groups, and the
+#     difference is not cosmetic: the flash LED's brightness attribute is
+#     chgrp'd to `video` by this port's own udev rule, so without that group
+#     the Flashlight tile turns itself straight back off and no light comes on.
+#     That is exactly what happened on the first image that shipped without an
+#     account.
+#   * linger.  The camera relays are system services backed by a user's
+#     PipeWire graph.  Without linger that graph only exists while someone is
+#     logged in, and an SSH login can create a temporary PipeWire socket that
+#     disappears on logout, leaving all four persistent V4L2 nodes serving
+#     black frames.
+#   * the relay service itself, which has to run *as* that user, with that
+#     user's runtime directory.  systemd has no way to spell "whoever owns this
+#     machine" in a unit file, so the answer is written into a drop-in here.
+#
+# Everything this touches lives under /run, so it is recomputed from scratch on
+# every boot and never goes stale.
+set -eu
+
+relay_unit=ubuntu-gts9u-camera-relays.service
+dropin_dir=/run/systemd/system/$relay_unit.d
+dropin=$dropin_dir/50-desktop-user.conf
+
+min_uid=$(awk '/^UID_MIN/ { print $2 }' /etc/login.defs 2>/dev/null | head -1)
+max_uid=$(awk '/^UID_MAX/ { print $2 }' /etc/login.defs 2>/dev/null | head -1)
+[ -n "${min_uid:-}" ] || min_uid=1000
+[ -n "${max_uid:-}" ] || max_uid=60000
+
+# Ordinary login accounts only, lowest UID first: the owner's account is the
+# one the wizard made, and on this image it is the only one.
+humans=$(getent passwd | awk -F: -v lo="$min_uid" -v hi="$max_uid" \
+	'$3 >= lo && $3 <= hi && $7 !~ /(nologin|false)$/ { print $3":"$1 }' | sort -n)
+
+if [ -z "$humans" ]; then
+	echo 'ubuntu-gts9u: no desktop user yet; the first-boot wizard has not run' >&2
+	exit 0
+fi
+
+# The groups the hardware needs.  This is the set the build used to pass to
+# useradd, minus the ones the wizard already grants.  A group that does not
+# exist on this system is skipped rather than treated as an error.
+device_groups='video render input audio dialout cdrom netdev plugdev'
+
+for entry in $humans; do
+	name=${entry#*:}
+
+	for group in $device_groups; do
+		getent group "$group" >/dev/null 2>&1 || continue
+		if ! id -nG "$name" 2>/dev/null | tr ' ' '\n' | grep -qx "$group"; then
+			usermod -aG "$group" "$name" && \
+				echo "ubuntu-gts9u: added $name to $group"
+		fi
+	done
+
+	install -d -m 0755 /var/lib/systemd/linger
+	[ -e "/var/lib/systemd/linger/$name" ] || \
+		install -m 0644 /dev/null "/var/lib/systemd/linger/$name"
+	# loginctl needs a running logind, which is not the case in the chroot the
+	# image is built in.  The stamp file above is the whole of what
+	# enable-linger writes, so only ask logind when it is actually there.
+	if [ -d /run/systemd/system ]; then
+		loginctl enable-linger "$name" >/dev/null 2>&1 || true
+	fi
+	echo "ubuntu-gts9u: linger enabled for $name"
+done
+
+owner=$(printf '%s\n' "$humans" | head -1)
+uid=${owner%%:*}
+name=${owner#*:}
+
+# Record the owner so the udev helper agrees with this service if the LED is
+# re-enumerated later.
+install -d -m 0755 /run/ubuntu-gts9u
+printf '%s\n' "$name" > /run/ubuntu-gts9u/desktop-user
+
+# The flash LED, owned outright rather than shared through a group.
+#
+# Group membership is decided when a session starts, and the wizard logs the
+# owner in the instant it creates the account — so on the boot that matters,
+# adding them to `video` above comes too late and the Flashlight tile still
+# does nothing.  That is the second time this bug shipped.  Ownership has no
+# such window: it is a property of the file, not of the session.  The group
+# stays as the fallback for anything that re-runs the udev rule.
+flash_brightness=/sys/class/leds/white:flash/brightness
+if [ -e "$flash_brightness" ]; then
+	chown "$name" "$flash_brightness" && \
+		echo "ubuntu-gts9u: flash LED handed to $name"
+fi
+
+mkdir -p "$dropin_dir"
+cat > "$dropin" <<EOF
+# Written at boot by ubuntu-gts9u-desktop-user.  Do not edit: it is recreated
+# from the account list on every boot.
+[Unit]
+After=user@$uid.service
+Wants=user@$uid.service
+
+[Service]
+User=$name
+Group=$name
+Environment=XDG_RUNTIME_DIR=/run/user/$uid
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus
+EOF
+echo "ubuntu-gts9u: camera relays bound to $name (uid $uid)"
+
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || true
+
+	# The ADSP is started after the root filesystem is mounted.  On some boots
+	# the owner's user manager and WirePlumber are already running by the time
+	# the resulting ALSA card appears.  WirePlumber then keeps the incomplete
+	# card it saw first: only the off/pro-audio profiles exist and GNOME shows
+	# Dummy Output/Input even though /proc/asound/cards is healthy.  The sound
+	# card's later udev event does not make WirePlumber rebuild that object.
+	#
+	# Wait for the actual control node, then refresh only the session manager.
+	# Restarting the ADSP here would be actively harmful: ASoC cannot rebind the
+	# card after a hot remoteproc restart on this kernel.  A per-boot stamp keeps
+	# PathChanged=/home or package upgrades from disrupting an already healthy
+	# session more than once.  Do this before starting the camera relays because
+	# WirePlumber also owns the libcamera nodes they consume.
+	audio_stamp=/run/ubuntu-gts9u/audio-session-refreshed-$uid
+	if [ ! -e "$audio_stamp" ]; then
+		attempt=0
+		while [ ! -e /dev/snd/controlC0 ] && [ "$attempt" -lt 20 ]; do
+			sleep 1
+			attempt=$((attempt + 1))
+		done
+
+		if [ -e /dev/snd/controlC0 ]; then
+			systemctl start "user@$uid.service" || true
+			attempt=0
+			while [ ! -S "/run/user/$uid/bus" ] && [ "$attempt" -lt 10 ]; do
+				sleep 1
+				attempt=$((attempt + 1))
+			done
+
+			if [ -S "/run/user/$uid/bus" ] &&
+				runuser -u "$name" -- env \
+					XDG_RUNTIME_DIR="/run/user/$uid" \
+					DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+					systemctl --user restart wireplumber.service; then
+				# A profile explicitly left at `off` is persistent state.  It is
+				# uncommon, but selecting HiFi here also makes recovery work after
+				# such a state instead of relying on WirePlumber's default choice.
+				profile_set=
+				attempt=0
+				while [ "$attempt" -lt 10 ]; do
+					if runuser -u "$name" -- env \
+						XDG_RUNTIME_DIR="/run/user/$uid" \
+						DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+						pactl set-card-profile alsa_card.platform-sound HiFi \
+						>/dev/null 2>&1; then
+						profile_set=1
+						break
+					fi
+					sleep 1
+					attempt=$((attempt + 1))
+				done
+
+				if [ "$profile_set" = 1 ]; then
+					install -m 0644 /dev/null "$audio_stamp"
+					echo "ubuntu-gts9u: refreshed $name's HiFi session after ALSA appeared"
+				else
+					echo "ubuntu-gts9u: WirePlumber did not expose the HiFi profile for $name" >&2
+				fi
+			else
+				echo "ubuntu-gts9u: could not refresh $name's audio session" >&2
+			fi
+		else
+			echo 'ubuntu-gts9u: ALSA card did not appear; leaving the camera relays independent' >&2
+		fi
+	fi
+
+	# graphical.target was reached long before the account existed, so the
+	# relay service was skipped by its own condition and nothing would ever
+	# come back for it: cameras stayed dead until the next boot.  Now that the
+	# drop-in exists the condition holds, so ask for it.
+	#
+	# --no-block matters: the relay unit Requires= this one, so waiting for its
+	# start job from inside this one would be waiting for ourselves.  If the
+	# owner's PipeWire is not up yet the relays fail and retry every two
+	# seconds, which is what Restart=always is there for.
+	systemctl start --no-block "$relay_unit" || true
+fi

@@ -1,0 +1,28 @@
+[Unit]
+Description=Watch for the account the first-boot wizard creates
+# Without this, everything the account needs — its device groups, its linger,
+# the camera relay drop-in — would only be applied on the *next* boot, because
+# the wizard creates the account long after multi-user.target.  The owner would
+# finish setup and find no cameras and a Flashlight tile that does nothing,
+# with no hint that rebooting fixes it.
+
+[Path]
+# Watching /etc/passwd was the obvious choice and it does not work: useradd and
+# accountsservice write a temporary file and rename it into place, so the inode
+# systemd is watching is replaced rather than modified and PathChanged never
+# fires.  Measured on the tablet — the account existed, the groups had not been
+# applied, and the journal had no second run of the service.
+#
+# Watching /home for changes catches the same event from somewhere that does
+# get an inotify edge: creating a home directory changes the directory.
+#
+# It must be PathChanged and not PathExistsGlob=/home/*.  PathExists* is level
+# triggered: it fires whenever the condition holds and the service is not
+# running, so with a oneshot that exits — which this one now is — it re-fires
+# the instant the service finishes, loops, and systemd stops both units on the
+# start limit.  That is exactly what the first build with this unit did.
+PathChanged=/home
+PathChanged=/etc/passwd
+
+[Install]
+WantedBy=multi-user.target

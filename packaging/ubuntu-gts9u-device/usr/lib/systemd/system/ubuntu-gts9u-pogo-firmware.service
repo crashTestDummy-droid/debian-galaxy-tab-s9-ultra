@@ -1,0 +1,21 @@
+[Unit]
+Description=Restore the Samsung STM32 pogo keyboard application
+Documentation=file:/usr/share/doc/ubuntu-gts9u-device/pogo-keyboard.md
+After=local-fs.target
+
+# Only the firmware blob is asserted here.  The controller's sysfs node used to
+# be a condition too, and it made the unit unreliable: systemd cannot order a
+# unit behind the very target that pulls it in, so an earlier
+# "After=multi-user.target" was silently ignored, the unit ran alongside
+# everything else at about three seconds, and the driver had not yet bound at
+# 3.9 s.  The condition then failed and the whole restore was skipped without a
+# word.  Waiting for the device belongs in the helper, where it can be bounded
+# and logged.
+ConditionPathExists=/lib/firmware/keyboard_stm/stm32_gts9family.bin
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/ubuntu-gts9u-pogo-firmware-update
+
+[Install]
+WantedBy=multi-user.target

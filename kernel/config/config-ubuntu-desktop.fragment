@@ -1,0 +1,136 @@
+# Kernel options an Ubuntu desktop needs, on top of the hardware fragment
+# inherited from the postmarketOS port.
+#
+# Everything here is =y on purpose.  This port does not install a general
+# module tree — only the two isolated ath12k modules ship — so a symbol left at
+# =m is effectively absent on the running system.  That single fact caused
+# every failure this fragment fixes.
+
+# --- snaps -------------------------------------------------------------------
+# Every snap is a squashfs image that snapd attaches to a loop device.  With
+# SQUASHFS=m the mount simply cannot happen, so `apt install firefox` and
+# `apt install chromium` both fail: in Ubuntu those are transitional packages
+# whose entire job is to install a snap.
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_FILE_DIRECT=y
+# The decompressor parallelisation options live inside a Kconfig choice and
+# cannot be set individually; this is the one standalone symbol that turns them
+# all on and lets the mount pick.
+CONFIG_SQUASHFS_CHOICE_DECOMP_BY_MOUNT=y
+CONFIG_SQUASHFS_XATTR=y
+CONFIG_SQUASHFS_ZLIB=y
+CONFIG_SQUASHFS_LZ4=y
+CONFIG_SQUASHFS_LZO=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_SQUASHFS_ZSTD=y
+
+# snapd layers writable data over the read-only snap, and several desktop
+# portals and flatpak-style runtimes want FUSE.
+CONFIG_OVERLAY_FS=y
+CONFIG_FUSE_FS=y
+
+# --- AppArmor ----------------------------------------------------------------
+# Ubuntu confines snaps and much of the desktop with AppArmor, and userspace
+# ships profiles that silently do nothing without it.  lockdown stays in the
+# list: this port pairs a signed kernel with signed ath12k modules and depends
+# on it.
+CONFIG_SECURITY_APPARMOR=y
+CONFIG_SECURITY_APPARMOR_HASH=y
+CONFIG_SECURITY_APPARMOR_HASH_DEFAULT=y
+CONFIG_DEFAULT_SECURITY_APPARMOR=y
+CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,apparmor,bpf"
+
+# --- binfmt_misc -------------------------------------------------------------
+# Without this, systemd-binfmt.service and proc-sys-fs-binfmt_misc.mount both
+# fail on every boot and systemd reports the system as degraded.  It is also
+# the mechanism FEX and Box64 need to run x86 binaries later.
+CONFIG_BINFMT_MISC=y
+
+# --- filesystems a desktop actually meets ------------------------------------
+# Removable media handed to this tablet will not all be ext4 or FAT32.
+CONFIG_EXFAT_FS=y
+# NTFS3 is "depends on !NTFS_FS || m", so while the legacy driver is enabled
+# NTFS3 can only ever be a module, which on this port means absent.  The legacy
+# driver is not wanted here anyway.
+# CONFIG_NTFS_FS is not set
+CONFIG_NTFS3_FS=y
+CONFIG_NTFS3_LZX_XPRESS=y
+CONFIG_ISO9660_FS=y
+CONFIG_JOLIET=y
+CONFIG_ZISOFS=y
+CONFIG_UDF_FS=y
+
+# Ubuntu 24.04 ships libgpiod 1.6, whose diagnostic tools use GPIO chardev ABI
+# v1.  Keep the current ABI v2 and expose v1 compatibility as well.
+CONFIG_GPIO_CDEV_V1=y
+
+# --- container and sandbox plumbing ------------------------------------------
+# Snap confinement, systemd-nspawn and the networking that portals expect.
+CONFIG_VETH=y
+CONFIG_BRIDGE=y
+CONFIG_NETFILTER_XTABLES=y
+CONFIG_NF_TABLES=y
+# Waydroid's host network and Android netd. These modules are built and signed
+# by build-netfilter-modules.sh and included in the release module payload.
+CONFIG_NF_CONNTRACK=m
+CONFIG_NF_NAT=m
+CONFIG_IP_NF_IPTABLES=m
+CONFIG_IP_NF_IPTABLES_LEGACY=m
+CONFIG_IP_NF_FILTER=m
+CONFIG_IP_NF_NAT=m
+CONFIG_IP_NF_MANGLE=m
+CONFIG_IP_NF_RAW=m
+CONFIG_IP6_NF_IPTABLES=m
+CONFIG_IP6_NF_IPTABLES_LEGACY=m
+CONFIG_IP6_NF_FILTER=m
+CONFIG_IP6_NF_NAT=m
+CONFIG_IP6_NF_MANGLE=m
+CONFIG_IP6_NF_RAW=m
+CONFIG_NETFILTER_XT_TARGET_CHECKSUM=m
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE=m
+CONFIG_NETFILTER_XT_MATCH_CONNTRACK=m
+CONFIG_NETFILTER_XT_MATCH_OWNER=m
+CONFIG_UNIX_DIAG=y
+CONFIG_PACKET_DIAG=y
+CONFIG_NETLINK_DIAG=y
+
+# --- SoC identity ------------------------------------------------------------
+# The Qualcomm socinfo driver is what populates /sys/bus/soc/devices/soc0,
+# which is the standard place userspace asks who the SoC is on ARM.  The
+# inherited config leaves it =m, and this port ships no modules other than the
+# two signed ath12k ones, so it was simply never there.
+CONFIG_QCOM_SOCINFO=y
+
+# --- secure execution infrastructure ----------------------------------------
+# The experimental fingerprint stack is selected explicitly by
+# build-mainline-kernel.sh. TEE itself is common infrastructure and safe to
+# retain in the normal build.
+CONFIG_TEE=y
+
+# --- S Pen digitiser ---------------------------------------------------------
+# This port's own driver for the Wacom EMR digitiser on SE3.  The two mainline
+# candidates were tried first and are deliberately left out: wacom_i2c reads the
+# query little-endian from the wrong offsets, and wacom_w9000 only covers the
+# W9002 and W9007A.  Carrying them would only make it ambiguous which driver a
+# future failure came from.
+CONFIG_TOUCHSCREEN_SAMSUNG_WACOM_W90XX=y
+
+# --- CPU frequency scaling ---------------------------------------------------
+# Without this the tablet has no cpufreq at all: no /sys/.../cpufreq, no
+# policies, no schedutil, and eight cores pinned at whatever frequency the
+# firmware left them on.  It idles warm — 57 to 63 C doing nothing — for that
+# reason alone.
+#
+# The chain is only visible from one line of dmesg:
+#
+#   platform 17d91000.cpufreq: deferred probe pending:
+#       qcom-cpufreq-hw: Failed to find icc paths
+#
+# qcom-cpufreq-hw resolves the interconnect paths named by the CPU nodes before
+# it registers anything.  Those name three providers, by phandle: gem-noc (0x7),
+# mc-virt (0x8) and epss-l3 (0x9).  The first two bind to qnoc-sm8550; the third
+# is driven by INTERCONNECT_QCOM_OSM_L3, which the inherited config leaves at =m
+# — so 17d90000.interconnect never got a driver, one path never resolved, and the
+# probe deferred for the rest of the boot.  Exactly the failure mode this
+# fragment's header warns about, one more time.
+CONFIG_INTERCONNECT_QCOM_OSM_L3=y

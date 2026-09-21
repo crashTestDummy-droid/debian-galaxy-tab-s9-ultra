@@ -1,0 +1,130 @@
+# Procedencia de las fuentes de kernel importadas
+
+La base bajo `kernel/` procede del port postmarketOS del mismo dispositivo. El
+inventario también identifica las extensiones propias desarrolladas después y
+su relación con Linux y con los datos públicos o stock usados como referencia:
+
+- Repositorio de origen:
+  <https://github.com/agcarbajo/postmarketos-galaxy-tab-s9-ultra>
+- Commit de referencia del relevo: `b1dcca0`
+- Paquete de origen:
+  `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/`
+- Baseline: postmarketOS v1.71, kernel package r114
+- Kernel base: Linux mainline 7.2-rc3, commit
+  `a13c140cc289c0b7b3770bce5b3ad42ab35074aa`
+
+Licencias, sin excepción:
+
+| Ruta | Licencia | Motivo |
+|---|---|---|
+| `kernel/drivers/*.c` | `GPL-2.0-only` | Obras derivadas de Linux |
+| `kernel/patches/*.patch` | `GPL-2.0-only` | Obras derivadas de Linux |
+| `kernel/dts/*.dts` | `BSD-3-Clause` | Convención de los DTS Qualcomm upstream |
+| `kernel/config/*` | `MIT` | Configuración del proyecto |
+
+La cabecera SPDX de cada fichero prevalece sobre el MIT por defecto del
+repositorio.
+
+## Inventario
+
+### Actualización Gunyah de 2026-09-07
+
+Los hashes del inventario original describen la importación inicial. Para los
+parches Gunyah modificados durante las pruebas runtime7–runtime9, prevalecen
+estos hashes SHA-256 de los ficheros actuales:
+
+- `gunyah-host-vm-manager.patch`:
+  `eac355b714c94bf918416ebb1c6d278521842b28c4968c7379f878e97872c3f4`.
+  Añade el ABI HVC inmediato legacy, la detección de UUID Qualcomm y la lectura
+  del VMID primario desde el DT de firmware. Las colas RM y la asignación de
+  memoria se han ejercitado físicamente; la ejecución de vCPU sigue pendiente.
+- `gunyah-qtvm-auth.patch`:
+  `99ab15300cbaa08de7881b320ea3ae1664e7f6c61265a37730e639041ad0b979`.
+  Adapta los descriptores de autenticación QTVM y RPC correspondientes de
+  Android Common al gestor de VMs legacy. La aceptación del descriptor está
+  probada; no se ha autenticado ni arrancado un guest QTVM.
+- `gunyah-qtvm-cma.patch`:
+  `256edea6dd5956d5143ecab21ffcad2a89f7c526c5f4300d502b3e3e0abbd932`.
+  Adaptación GPL-2.0-only de la interfaz CMA de Android Common
+  `65994b7471f1fd37242ff4a5032a812f5c168ae6`, con referencias de fichero/dispositivo,
+  exclusión mutua, validación de rangos, puesta a cero y pool diagnóstico opt-in
+  que reutiliza el CMA existente sin modificar el DTB de arranque.
+
+Fuentes: [CMA de Android Common](https://android.googlesource.com/kernel/common/+/65994b7471f1fd37242ff4a5032a812f5c168ae6/drivers/virt/gunyah/vm_mgr_cma_mem.c)
+y [parser legacy del Resource Manager](https://github.com/quic/gunyah-resource-manager/blob/0accef9/src/vm_config/vm_config_parser.c).
+Las pruebas y límites de runtime9 están en `docs/virtualization.md`.
+
+Correcciones propias de aislamiento de plataforma, validadas el 2026-09-08:
+
+- `gunyah-qcom-runtime-overlay-platform-guard.patch`:
+  `d7436eb1762f29d441bfa40f414c33192a9a3476878e258b9b3e32c11c6c1784`.
+  Limita la llamada privada de descubrimiento al compatible SM-X910 probado;
+  evita una instrucción indefinida al arrancar el kernel como guest QEMU virt.
+- `gunyah-qcom-platform-scm-guard.patch`:
+  `c86deb6ea558899ca44aae45bc4cde6b9b332810224cf8a01374b3d2bd4341d7`.
+  Exige un proveedor SCM inicializado antes de consultar el UUID privado.
+  El hook protegido carga en la tablet y pasa la prueba no destructiva de
+  VM/memoria/vCPU. Ambos guards permiten llegar a shell y apagar un guest
+  Linux TCG en la tablet, sin cambiar el kernel host instalado.
+
+### Importación inicial
+
+Se completa a medida que se importa cada fichero, con el hash SHA-256 de la
+copia de origen para poder detectar divergencias futuras.
+
+| Fichero | Origen en el port pmOS | SHA-256 de origen |
+|---|---|---|
+| `configs/dtbo/gts9uwifi-board00-noop.dts` | `configs/dtbo/gts9uwifi-board00-noop.dts` | `d205430481e46caa67932a77b3a4712f3b8ead5a96ef688190fbffca2a159e0f` |
+| `configs/dtbo/gts9uwifi-board03-noop.dts` | `configs/dtbo/gts9uwifi-board03-noop.dts` | `fe4cc70edb5e2c92b3c34bfbfca3d15c2ad386feaa6ddc109ebbe632acbd9145` |
+| `configs/vendor_boot/bootconfig.txt` | `configs/vendor_boot/bootconfig.txt` | `f85fa97b8a180cac5e1bc583585e774042df5b5a756119d6b31cacd3504c16e0` |
+| `configs/vendor_boot/cmdline.txt` | `configs/vendor_boot/cmdline.txt` | `847006d1438a43e1e848f6ab42e1f7cabbf85b7c7b955d2c7f2bd5ceac48c793` |
+| `kernel/config/config-gts9uwifi.fragment` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/config-gts9uwifi.fragment` | `c6b57032a2171dec1c847385adee5d4263769c3578acba629c0fa023285f9b8f` |
+| `kernel/config/config-mainline.aarch64` | `/root/pmos-gts9u/pmaports/device/main/linux-postmarketos-mainline/config-mainline.aarch64` | `661c45023794690f38609be08e5a2a0b77eef5224f48f971f6d709a1871d132b` |
+| `kernel/drivers/panel-samsung-ana38407.c` | Base de `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/panel-samsung-ana38407.c`; extensión UDFPS propia sobre DRM/MIPI DSI con secuencias del panel stock del SM-X910 | `354a5dad9aa119475971d6b7bb347293c2afaff1384f9c79c589f065cddeae24` (base importada) |
+| `kernel/drivers/egis_el721.c` | Obra propia sobre las interfaces GPIO/misc de Linux y la parte no sensible de la ABI EgisTec; GPIO91/GPIO155, temporización y metadatos contrastados con el overlay y controlador GPL stock del SM-X910 | — (no es una copia importada) |
+| `kernel/drivers/qcom_spss.c` | Adaptación a Linux 7.2 del controlador SPSS GPL publicado por Samsung en el paquete de fuentes del SM-X910; añade publicación dinámica de los recursos DZA1 para conservar el DTB validado por ABL | `5954327671b10da7c985b1273a3d565e827047415eb940319ffcac971bff3b2d` |
+| `kernel/drivers/qcom_glink_spss.c` | Adaptación a las interfaces GLINK/RPMSG mainline del controlador SPSS GPL publicado por Samsung en el paquete de fuentes del SM-X910 | `9847ee6f52dc996e838dc27ffe690cf6f57fdf66e4a89048af60651e0bdc0978` |
+| `kernel/drivers/spcom.c` | Adaptación a Linux 7.2 del multiplexor SPCOM GPL publicado por Samsung en el paquete de fuentes del SM-X910; conserva la ABI de usuario que emplean `sec_nvm` y `spdaemon` | `5080049454f76fb84823632ad7cb026335c930e29d9f639d9c76479e22c35c35` |
+| `kernel/drivers/spss_utils.c` | Adaptación a Linux 7.2 del coordinador de eventos SPSS GPL publicado por Samsung en el paquete de fuentes del SM-X910; conserva los IOCTL de `/dev/spss_utils` usados por `libspcom` y sustituye los notificadores SSR downstream por un subdispositivo `remoteproc` | `344532210eb15266c743d7334157657a64fe483ea865975733398a586e81f8a5` |
+| `kernel/include/linux/remoteproc/qcom_spss.h` | Cabecera adaptada del controlador SPSS GPL publicado por Samsung en el paquete de fuentes del SM-X910 | `275e5fea17092185ab5043a4e075d4570873de0a79e21e64b89e24f941c001f6` |
+| `kernel/include/uapi/linux/spcom.h` | Cabecera UAPI GPL importada del paquete de fuentes del SM-X910 para mantener la ABI SPCOM stock | `eb061c0308f6b7dacf512f48ad5d3e9d0c27b57fbd36014251ecfcbeaeac9fb4` |
+| `kernel/include/uapi/linux/spss_utils.h` | Cabecera UAPI GPL importada del paquete de fuentes del SM-X910 para mantener la ABI binaria de eventos SPSS stock | `0d8283cf0e28e980e1332660ffdbc66df399e59386c92ec98ae4e9889e9dff4f` |
+| `kernel/drivers/hi1337_gts9u.c` | Obra propia sobre las interfaces V4L2/I²C de Linux; secuencias eléctricas y variantes contrastadas con el CamX stock del SM-X910 | — (no es una copia importada) |
+| `kernel/drivers/hi1337_gts9u_tables.h` | Generado de forma determinista desde los blobs Parameter Parser V3 del CamX stock del SM-X910; 1.476 registros globales y los modos exactos de sus tres módulos HI1337 | — (datos derivados del firmware de la propietaria) |
+| `kernel/drivers/dw9808_vcm.c` | Obra propia sobre las interfaces V4L2/I²C de Linux; identidad, dirección y secuencia de arranque contrastadas con el módulo CamX stock del SM-X910 | — (no es una copia importada) |
+| `kernel/drivers/ps5169.c` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/ps5169.c` | `9002b6a8b6794749dedb42e2530f040995916638f2af51d4fa9f898dfc997b74` |
+| `kernel/drivers/sm5440_direct.c` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/sm5440_direct.c` | `fd6ce815cfa8718d2ad0d01ea3cc712d93e73b7b2acb2a1ac18e6b7537852a34` |
+| `kernel/drivers/sm5714_battery.c` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/sm5714_battery.c` | `91e5766a09c91df4cdfb0f7ffbe297e68ab8e2b8c0392d777995fc56e50a656f` |
+| `kernel/drivers/sm5714_usbpd.c` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/sm5714_usbpd.c` | `f51803065b130427c1f733be595bd3230eca02c69f723c6a490774d6f7dd3a92` |
+| `kernel/drivers/samsung_stm32_pogo.c` | Adaptación mainline del protocolo de `kernel/vendor/samsung-stm32-pogo/` | Véase `kernel/vendor/samsung-stm32-pogo/SHA256SUMS` |
+| `kernel/dts/sm8550-samsung-gts9uwifi.dts` | Base de `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/sm8550-samsung-gts9uwifi.dts`; nodo EL721, raíl BTP y geometría derivados del overlay R03 stock | `a9ff4284183c7943b2a94ac704e19b3974a58197f082e2602e1aea09f7851937` (base importada) |
+| `kernel/patches/add-gts9uwifi-dtb.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/add-gts9uwifi-dtb.patch` | `36acdf4aff5abb1022edb431b39b0f99e680b9a006c859ed1f986fea7f788da3` |
+| `kernel/patches/add-samsung-sec-log-console.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/add-samsung-sec-log-console.patch` | `8a0d84ca1a2e32c937edca91752379429e42563a3308f1b880381191e6b3bfba` |
+| `kernel/patches/build-wcn-pcie-providers-in.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/build-wcn-pcie-providers-in.patch` | `279b162777a99f533eb09377270003ceef82c692e6de7faecbb47580182e5678` |
+| `kernel/patches/configure-nxp-ptn3222-from-dt.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/configure-nxp-ptn3222-from-dt.patch` | `80332e96ee5b468b1183e239ff1e8cdf663a688808e6d13b66047767adbbc0b7` |
+| `kernel/patches/expose-separate-gpu-kms-resources.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/expose-separate-gpu-kms-resources.patch` | `9578cd1687a11d9780a617cb4335a2780b16ccb1d0835856d9e85e40213d872d` |
+| `kernel/patches/ignore-console-null.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/ignore-console-null.patch` | `70b4930e1bdcd99769e59de783ddafafbfe5ec377e3d6c166ef9c63197906123` |
+| `kernel/patches/keep-sec-log-previous-index-current.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/keep-sec-log-previous-index-current.patch` | `11b21da7037440b0726c40becd7c5165fe00fcd69bf0165904a3b9b6a61512cd` |
+| `kernel/patches/hi847-add-devicetree-power.patch` | Obra propia sobre `drivers/media/i2c/hi847.c` de Linux 7.2-rc3 para añadir enlace DT y la secuencia eléctrica medida del SM-X910 | — (derivado del kernel fijado arriba) |
+| `kernel/patches/match-samsung-sm8550-eusb2-phy-init.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/match-samsung-sm8550-eusb2-phy-init.patch` | `187d3d425c06ce1c1a204e5655457e39c9771457ad6cb2279243aec49a295990` |
+| `kernel/patches/qmp-ufs-reset-serdes-before-power-down-gts9u.patch` | Corrección propia sobre UFS Qualcomm/QMP de Linux 7.2-rc3; durante la suspensión del sistema del SM-X910, y sólo entonces, afirma el reset de PCS y detiene SerDes antes de retirar alimentación. El alcance evita alterar el encendido inicial y el clock gating ordinario | — (derivado del kernel fijado arriba; secuencia contrastada con el controlador Qualcomm anterior a `a079b2d71534`; alcance validado mediante una prueba A/B de arranque) |
+| `kernel/patches/msm-dp-allow-unresolved-usbc-bridge.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/msm-dp-allow-unresolved-usbc-bridge.patch` | `3a1561c3377e7ad825d2f1e147e6ab3a24376f366a9610061c2c7cc3fd9d591c` |
+| `kernel/patches/msm-dp-associate-bridge-of-node.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/msm-dp-associate-bridge-of-node.patch` | `998f27d4ae3d44c175268150850e62a33e87c4a87bb57e175e93eae69289a746` |
+| `kernel/patches/msm-dp-defer-oob-hpd-until-resume.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/msm-dp-defer-oob-hpd-until-resume.patch` | `5ef69616b98a761353eb89fa7b386b6a761b452c0e30eca9417d9844ab8a7d47` |
+| `kernel/patches/msm-dpu-reassign-resources-with-encoder.patch` | Parche upstream de DRM/MSM/DPU v3 7/8 por Dmitry Baryshkov, aplicado sobre Linux 7.2-rc3 para mantener sincronizados los recursos CTL/DSPP y la reprogramación del encoder | `Message-Id: <20260912-fd-kms-fix-smmu-v3-7-a7ddc6fe2032@oss.qualcomm.com>` |
+| `kernel/patches/qcom-q6v5-mask-completed-handover-irq.patch` | Corrección propia sobre Linux 7.2-rc3 para la IRQ one-shot de handover del ADSP | `a221e088bc4c33f7ff86dfeaa155f46c4f1d947638e2b96729299f6882626598` |
+| `kernel/patches/qcomtee-use-tzmem-pool.patch` | Extensión propia sobre QCOMTEE de Linux 7.2-rc3 para respaldar objetos de 2 MiB o más con memoria física DMA32 contigua de `qcom_tzmem`; reproduce las regiones de `dualfp`/BAUTH medidas en One UI | — (derivado del kernel fijado arriba) |
+| `kernel/patches/qcomtee-add-spss-shared-heap.patch` | Extensión propia sobre el heap protegido de TEE y QCOMTEE de Linux 7.2-rc3; publica la reserva `spu-tz-shared` stock y la asigna por SCM al dominio `CP_SPSS_SP_SHARED` usado por el arranque de Keymaster/SPU | — (derivado del kernel fijado arriba; semántica y VMID contrastados con `libspcom.so` y el kernel GPL stock del SM-X910) |
+| `kernel/patches/gunyah-host-vm-manager.patch` | Backport del host Gunyah de Android Common Kernel: hipercalls arm64, colas de mensajes, Resource Manager, gestor de VMs, memoria, vCPU, irqfd/ioeventfd y hooks Qualcomm; adaptado a las APIs de Linux 7.2 (`fd_file`, `eventfd_signal`, irqdomain, retirada de platform driver y cabecera QCOM SCM), sin reservas ABI exclusivas de GKI, con los compatibles del Resource Manager generado por el firmware Qualcomm, detección del UUID Qualcomm por SMC explícito además del conducto SMCCC activo y compatibilidad con firmware legacy-v1 sin `HYP_IDENTIFY` | commit `9f6af9a6c2cc38808a531ba76b47a1bc6e4fe47e` y correcciones posteriores de `arch_is_gunyah_guest()`, `android.googlesource.com/kernel/common`; parche resultante SHA-256 `2228df254c8cfd2c3585f0b9caa09633db4f748c5998519ee3ef5affdb8b0c8d` |
+| `kernel/patches/gunyah-qcom-runtime-overlay.patch` | Importador propio del `HypBootInfo` publicado por ABL mediante SMC `0x02000609`; copia de forma segura el DTBO por arranque, conserva sólo el fragmento RM, adapta sus dos SPI del formato GIC de tres celdas al de cuatro celdas de SM8550 mainline y puebla el dispositivo de plataforma sin modificar el DTB que valida ABL | — (estructura y DTBO de 1536 bytes recuperados físicamente; overlay vivo e identificación legacy-v1 validados en el SM-X910); SHA-256 `87a7382ab45b9acd36ee36c4240ecdc1ff5823c1556197a0dbbdb26228476f8e` |
+| `kernel/patches/gunyah-sm8550-overlay-anchors.patch` | Experimento conservado como evidencia, pero no aplicado por el build: adaptación mínima del DT base para los fixups downstream del DTBO Gunyah | — (la aplicación offline funciona, pero ABL rechazó físicamente tanto el DTB base modificado como el DTBO selector y entró en recovery/Download Mode); SHA-256 `4c19a5ca520fb6a78f49bd35597c2d731a2b32131700ef3fd655eb02f30c66dd` |
+| `kernel/patches/qcomtee-allow-admin-null-credentials.patch` | Parche diagnóstico propio y opt-in para reproducir el `registerWithCredentials(NULL)` del smcinvoke downstream; no se aplica a builds normales ni releases | — (derivado del kernel fijado arriba) |
+| `kernel/patches/set-mi2s-codec-dai-format.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/set-mi2s-codec-dai-format.patch` | `442ea71ece9b3574f409bb620810e811716404456682c5e6b77edb9dd2c4647b` |
+| `kernel/patches/support-samsung-goodix-16-byte-events.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/support-samsung-goodix-16-byte-events.patch` | `0ce2f9466eae22c427b03c5af6a6c7a07fb3530d378581d946d262909d574f3e` |
+| `kernel/patches/support-goodix-samsung-fod.patch` | Obra propia sobre Goodix Berlin de Linux 7.2-rc3; formato sponge, eventos FOD y comando 0xF2 contrastados con el controlador GPL stock del SM-X910 | — (derivado del kernel fijado arriba) |
+| `kernel/patches/cleanup-goodix-fod-on-suspend.patch` | Corrección propia sobre la extensión FOD anterior para cerrar la sesión, liberar el tacto regional y notificar al cliente antes de suspender | — (derivado del kernel fijado arriba) |
+| `kernel/patches/tcpm-adopt-retained-source-ufp-role.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/tcpm-adopt-retained-source-ufp-role.patch` | `eef7cd7b96373ee8a02ec0d8be91f4e3715a2594a44eb4963ea504dc5199a5b2` |
+| `kernel/patches/tcpm-use-retained-sink-data-role.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/tcpm-use-retained-sink-data-role.patch` | `2565ee41257290bd4828fd80a8beda377f284fb2154aab66e47a53a3ebe178c5` |
+| `kernel/patches/unpark-pcie0-pipe-mux.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/unpark-pcie0-pipe-mux.patch` | `b435e5297a34ce353eb8e4793546d35c21e120e7ee04b547b73ec1d72dc2dc9b` |
+| `kernel/patches/upgrade-partial-goodix-samsung-events.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/upgrade-partial-goodix-samsung-events.patch` | `4f4f03061bca74cf72d3745d86509d90e425a32245f0770dbf44eb50da241993` |
+| `kernel/patches/wcn7850-pwrseq-cold-reset-aop.patch` | `pmaports/device/testing/linux-samsung-gts9uwifi-mainline/wcn7850-pwrseq-cold-reset-aop.patch` | `d1fcad07f00cd87f4b5bbce7cb32128e23023c34f05e94dbba3da5d85e2816a9` |

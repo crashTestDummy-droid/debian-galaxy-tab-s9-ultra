@@ -1,0 +1,27 @@
+[Unit]
+Description=Galaxy Tab S9 Ultra standard V4L2 cameras
+# User=, its runtime directory and the ordering against user@UID.service all
+# come from a drop-in that ubuntu-gts9u-desktop-user writes at boot.  They
+# cannot be named here any more: the account belongs to the owner and is
+# created in the first-boot wizard, so the image does not know it.
+#
+# The condition on that drop-in is what keeps a machine whose wizard has not
+# run yet from restart-looping this service as root every two seconds.
+After=systemd-modules-load.service systemd-user-sessions.service
+Requires=ubuntu-gts9u-desktop-user.service
+After=ubuntu-gts9u-desktop-user.service
+ConditionPathExists=/dev/video20
+ConditionPathExists=/run/systemd/system/ubuntu-gts9u-camera-relays.service.d/50-desktop-user.conf
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+SupplementaryGroups=video
+ExecStart=/usr/libexec/ubuntu-gts9u-camera-relays
+ExecStartPost=+/usr/libexec/ubuntu-gts9u-camera-udev-refresh
+Restart=always
+RestartSec=2
+TimeoutStartSec=15
+
+[Install]
+WantedBy=graphical.target

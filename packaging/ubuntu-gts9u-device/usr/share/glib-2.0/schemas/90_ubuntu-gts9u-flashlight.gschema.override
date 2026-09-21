@@ -1,0 +1,18 @@
+# The Flashlight quick-settings tile is a system extension, and it has to be
+# enabled for whoever ends up owning the device.  Writing it into one user's
+# gsettings only works when the build knows that user's name in advance, which
+# stopped being true when the account moved to the first-boot wizard.
+#
+# Nothing else in this image sets enabled-extensions: Ubuntu's own extensions
+# come from the session mode in gnome-shell, not from this key, so setting the
+# default here adds ours without displacing any of theirs.
+#
+# This changes the default, so the owner can still turn it off in Extensions
+# and that choice will win.
+# enabled-extensions is one key, so every extension this image ships has to be
+# listed here together: a second override file would replace this list rather
+# than add to it, and whichever sorted last would win.  The dual boot entry
+# comes from ubuntu-gts9u-companion, so that package must be installed for it
+# to appear — an unknown UUID in this list is ignored, not an error.
+[org.gnome.shell]
+enabled-extensions=['flashlight@ubuntu-gts9u', 'gts9u-fingerprint-overlay@agcarbajo', 'dualboot@agcarbajo.github.io', 'spen-dock@agcarbajo.github.io']

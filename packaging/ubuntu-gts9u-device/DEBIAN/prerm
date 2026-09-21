@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+# Do not leave the already-started wrapper and its four relay children running
+# from deleted files.  That state keeps the V4L2 names visible but can only
+# serve black frames after the matching PipeWire backend is removed.
+case "$1" in
+	remove|deconfigure)
+		systemctl stop ubuntu-gts9u-chromium-desktops.path ubuntu-gts9u-chromium-desktops.service >/dev/null 2>&1 || true
+		/usr/libexec/ubuntu-gts9u-chromium-desktops --remove
+		/usr/libexec/ubuntu-gts9u-chromium-launchers --remove
+		systemctl stop ubuntu-gts9u-cpu-boost.service >/dev/null 2>&1 || true
+		systemctl stop ubuntu-gts9u-camera-relays.service >/dev/null 2>&1 || true
+		;;
+esac
+
+exit 0

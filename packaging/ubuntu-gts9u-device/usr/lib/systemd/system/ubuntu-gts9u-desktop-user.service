@@ -1,0 +1,25 @@
+[Unit]
+Description=Bind the device services to the account the owner created
+# The account comes from the first-boot wizard, so this cannot be resolved when
+# the image is built: it runs every boot and picks up whoever exists by then,
+# and it must be finished before the camera relays are started.
+Wants=ubuntu-gts9u-adsp-boot.service
+After=systemd-logind.service systemd-user-sessions.service ubuntu-gts9u-adsp-boot.service
+Before=ubuntu-gts9u-camera-relays.service
+
+[Service]
+Type=oneshot
+# Deliberately NOT RemainAfterExit.  With it, the first run at boot — the one
+# that finds no account yet — left the unit "active (exited)", and every later
+# trigger from the .path unit was a `systemctl start` on an already-active
+# unit, which systemd correctly does nothing about.  The account would then
+# get its groups, its LED and its camera relays only on the *next* boot, which
+# is exactly what happened twice: everything worked, but only after a reboot
+# nobody had been told to do.
+#
+# Letting it go inactive costs nothing — it applies settings and exits — and
+# makes it re-runnable, which is the whole point of the .path unit.
+ExecStart=/usr/libexec/ubuntu-gts9u-desktop-user
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# Everything in this repository is consumed by Linux: the build runs in WSL
+# reading straight from this Windows checkout, and the TWRP installer runs
+# under /sbin/sh, where a CRLF shebang fails to execute at all.
+#
+# Forcing eol=lf repository-wide removes that whole class of bug, including for
+# the extensionless scripts under packaging/ that a per-extension rule misses.
+* text=auto eol=lf
+
+*.img binary
+*.xz binary
+*.gz binary
+*.zst binary
+*.zip binary
+*.deb binary
+*.dtb binary
+*.dtbo binary
+*.bin binary
+
+# Unified diffs legitimately prefix blank context lines with one space and
+# preserve context indentation after their marker. Validate the carried code
+# with checkpatch instead of treating those markers as defects in the patch
+# container itself.
+*.patch whitespace=-blank-at-eol,-space-before-tab

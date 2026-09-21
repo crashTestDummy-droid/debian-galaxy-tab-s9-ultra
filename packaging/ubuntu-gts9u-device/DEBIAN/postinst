@@ -1,0 +1,141 @@
+#!/bin/sh
+# Enable the device units from the package itself, so a rootfs built by any
+# route gets them and no build script has to remember.
+set -e
+
+# unit:target pairs.  The target is where the enablement symlink must appear,
+# which is what the verification below checks.
+UNITS='
+ubuntu-gts9u-chromium-desktops.service:multi-user.target
+ubuntu-gts9u-chromium-desktops.path:multi-user.target
+ubuntu-gts9u-grow-rootfs.service:basic.target
+ubuntu-gts9u-zram.service:basic.target
+ubuntu-gts9u-swapfile.service:multi-user.target
+ubuntu-gts9u-cpu-boost.service:graphical.target
+ubuntu-gts9u-battery-capacity.service:multi-user.target
+ubuntu-gts9u-panel-coldboot-recover.service:multi-user.target
+ubuntu-gts9u-adsp-boot.service:multi-user.target
+ubuntu-gts9u-sensor-registry.service:multi-user.target
+ubuntu-gts9u-powerkey.service:multi-user.target
+ubuntu-gts9u-bluetooth-address.service:multi-user.target
+ubuntu-gts9u-sensors-resume.service:multi-user.target
+ubuntu-gts9u-pogo-firmware.service:multi-user.target
+ubuntu-gts9u-desktop-user.service:multi-user.target
+ubuntu-gts9u-desktop-user.path:multi-user.target
+ubuntu-gts9u-camera-relays.service:graphical.target
+ubuntu-gts9u-fingerprint-ui.service:multi-user.target
+ubuntu-gts9u-fingerprint-secure.service:multi-user.target
+'
+
+case "$1" in
+	triggered)
+		/usr/libexec/ubuntu-gts9u-chromium-launchers
+		/usr/libexec/ubuntu-gts9u-chromium-desktops
+		;;
+	configure)
+		/usr/libexec/ubuntu-gts9u-chromium-launchers
+		/usr/libexec/ubuntu-gts9u-chromium-desktops
+		# Index the signed IRQ bridge for the matching installed kernel. Never
+		# load/unload it or restart the boot-lifetime secure owner on upgrade.
+		for module in /usr/lib/modules/*/updates/qcom_spss_irq.ko; do
+			[ -f "$module" ] || continue
+			release=${module#/usr/lib/modules/}
+			release=${release%%/*}
+			depmod -a "$release"
+		done
+		for pair in $UNITS; do
+			unit=${pair%%:*}
+			# deb-systemd-helper is not guaranteed inside a foreign-arch
+			# chroot, so fall back to systemctl.
+			if command -v deb-systemd-helper >/dev/null 2>&1; then
+				deb-systemd-helper enable "$unit" >/dev/null || true
+			fi
+			systemctl enable "$unit" >/dev/null 2>&1 || true
+		done
+
+		# Version 2.17 briefly shipped the desktop-user path unit with a
+		# level-triggered PathExistsGlob.  Once a home existed it relaunched the
+		# oneshot until both units hit systemd's start limit, which in turn kept
+		# the camera relay dependency stopped.  Loading the corrected edge-
+		# triggered unit is not enough on an upgrade: clear that persisted failure
+		# and put the path watcher back into service in the same transaction.
+		if [ -d /run/systemd/system ]; then
+			systemctl daemon-reload || true
+			systemctl restart ubuntu-gts9u-cpu-boost.service || true
+			systemctl start ubuntu-gts9u-battery-capacity.service || true
+			systemctl reset-failed \
+				ubuntu-gts9u-desktop-user.service \
+				ubuntu-gts9u-desktop-user.path \
+				ubuntu-gts9u-camera-relays.service || true
+			systemctl restart ubuntu-gts9u-desktop-user.path || true
+			# fprintd is D-Bus activated and normally inactive.  If a client kept
+			# it alive during this upgrade, restart it so the new QTEE dependency
+			# and device sandbox are effective immediately.
+			systemctl try-restart ubuntu-gts9u-fingerprint-ui.service || true
+			systemctl try-restart fprintd.service || true
+		fi
+
+		# The gsettings override that keeps gnome-settings-daemon off the
+		# power key only takes effect once the schemas are recompiled.
+		if command -v glib-compile-schemas >/dev/null 2>&1; then
+			glib-compile-schemas /usr/share/glib-2.0/schemas >/dev/null 2>&1 || true
+		fi
+		# Recompile Ubuntu GDM's vendor keyfiles, preserving its existing
+		# profile and other defaults. This does NOT restart GDM or log users out.
+		if [ -x /usr/share/gdm/generate-config ]; then
+			/usr/share/gdm/generate-config
+		fi
+		if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+			gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+		fi
+
+		# The software ISP allocates its output through udmabuf.  Apply the
+		# packaged video-group rule immediately on upgrades as well as at boot.
+		if command -v udevadm >/dev/null 2>&1; then
+			udevadm control --reload >/dev/null 2>&1 || true
+			udevadm trigger --action=add /sys/class/misc/udmabuf >/dev/null 2>&1 || true
+			udevadm trigger --action=add /sys/class/leds/white:flash >/dev/null 2>&1 || true
+		fi
+
+		# A fresh image has no account at all: the owner creates it in the
+		# first-boot wizard, so nothing here may name one.  New accounts get
+		# the Flashlight tile from the packaged gsettings override; this call
+		# is for accounts that already existed before that override did, and
+		# whose dconf therefore already has a value the default cannot reach.
+		for existing in $(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 { print $1 }'); do
+			/usr/libexec/ubuntu-gts9u-enable-extension "$existing" \
+				flashlight@ubuntu-gts9u || true
+			/usr/libexec/ubuntu-gts9u-enable-extension "$existing" \
+				gts9u-fingerprint-overlay@agcarbajo || true
+			/usr/libexec/ubuntu-gts9u-enable-extension "$existing" \
+				spen-dock@agcarbajo.github.io || true
+		done
+
+		# Apply the dynamic owner, device groups, linger and relay drop-in now too
+		# so an upgrade does not have to reboot.  Remember whether the relays were
+		# already serving clients: the helper deliberately uses `start`, which is
+		# right at first boot but would leave an upgraded relay binary running from
+		# its old inode until the next reboot.
+		relays_were_active=false
+		if systemctl is-active --quiet ubuntu-gts9u-camera-relays.service 2>/dev/null; then
+			relays_were_active=true
+		fi
+		/usr/libexec/ubuntu-gts9u-desktop-user || true
+		if $relays_were_active; then
+			systemctl restart ubuntu-gts9u-camera-relays.service || true
+		fi
+
+		# Verify rather than assume: a unit that silently failed to enable
+		# shows up on the tablet only as a feature that quietly does nothing.
+		for pair in $UNITS; do
+			unit=${pair%%:*}
+			target=${pair##*:}
+			if [ ! -e "/etc/systemd/system/$target.wants/$unit" ] && \
+			   [ ! -e "/usr/lib/systemd/system/$target.wants/$unit" ]; then
+				echo "ubuntu-gts9u-device: WARNING: $unit is not enabled in $target" >&2
+			fi
+		done
+		;;
+esac
+
+exit 0

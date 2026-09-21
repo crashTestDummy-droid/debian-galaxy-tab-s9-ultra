@@ -1,0 +1,4 @@
+#!/bin/sh
+# Compatibility entry point retained for older rootfs builders.
+exec /usr/libexec/ubuntu-gts9u-enable-extension \
+	"${1-ubuntu}" flashlight@ubuntu-gts9u

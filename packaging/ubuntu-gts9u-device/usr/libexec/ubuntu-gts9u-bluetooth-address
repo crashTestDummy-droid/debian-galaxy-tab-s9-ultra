@@ -1,0 +1,139 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# Give the Bluetooth controller its real address.
+#
+# The WCN7850 NVM this device uses carries a null address, so hci0 comes up as
+# 00:00:00:00:5A:AD, stays DOWN, and BlueZ reports "No default controller
+# available".  The real address lives in the Samsung EFS partition, which is
+# mounted read-only with noload -- never written, never journalled -- just long
+# enough to read it.
+#
+# Derived from gts9uwifi-bluetooth-address of the postmarketOS port, with the
+# btmgmt handling rewritten after it wedged the boot on Ubuntu.
+#
+# btmgmt needs care in a service.  Two behaviours of BlueZ 5.72 were measured
+# on this device, and both silently defeated earlier versions of this script:
+#
+#  1. It is useless when stdin is /dev/null, which is exactly what systemd
+#     gives a service by default.  It exits 0 and prints NOTHING, so a `grep`
+#     on its output never matches and the caller concludes the controller is
+#     not there.  Feeding it an empty pipe instead makes it behave normally.
+#     A pty via script(1) also works; the pipe is used here because it needs no
+#     extra tool.
+#  2. Run before bluetoothd it can block in epoll_wait for minutes.  Hence the
+#     unit is ordered after bluetooth.service, and every call is bounded by a
+#     timeout anyway.
+#
+# The "is it already done?" probe deliberately uses hciconfig, an ioctl that
+# answers in about 3 ms and cannot block.
+#
+# Applying the address late costs nothing: an unconfigured controller is
+# unusable until it has one, and bluetoothd adopts it immediately afterwards
+# without needing a restart.
+set -u
+
+# Never call btmgmt directly: see note 1 above.
+btmgmt_() {
+	printf '' | timeout 10 btmgmt "$@" 2>/dev/null
+}
+
+efs=/dev/disk/by-partlabel/efs
+mountpoint=/run/ubuntu-gts9u-efs-ro
+deadline=30
+
+log() { echo "ubuntu-gts9u-bluetooth-address: $*" >&2; }
+
+current_address() {
+	# ioctl, not the management socket: cannot block.
+	timeout 5 hciconfig hci0 2>/dev/null | \
+		sed -n 's/.*BD Address: \([0-9A-Fa-f:]*\).*/\1/p' | head -1
+}
+
+# --- wait for the controller to exist at all ---------------------------------
+i=0
+while [ "$i" -lt "$deadline" ]; do
+	[ -d /sys/class/bluetooth/hci0 ] && break
+	sleep 1
+	i=$((i + 1))
+done
+if [ ! -d /sys/class/bluetooth/hci0 ]; then
+	log 'hci0 never appeared; leaving Bluetooth alone'
+	exit 0
+fi
+
+# --- read the native address -------------------------------------------------
+i=0
+while [ "$i" -lt "$deadline" ]; do
+	[ -b "$efs" ] && break
+	sleep 1
+	i=$((i + 1))
+done
+if [ ! -b "$efs" ]; then
+	log 'EFS partition not found; cannot set the native address'
+	exit 0
+fi
+
+mkdir -p "$mountpoint"
+cleanup() {
+	mountpoint -q "$mountpoint" && umount "$mountpoint" || true
+}
+trap cleanup EXIT
+# ro,noload is mandatory: EFS holds per-device calibration and must never be
+# written, and noload stops the kernel replaying its journal.
+if ! mount -o ro,noload "$efs" "$mountpoint"; then
+	log 'could not mount EFS read-only'
+	exit 0
+fi
+address=$(tr -d '\r\n[:space:]' < "$mountpoint/bluetooth/bt_addr" 2>/dev/null)
+cleanup
+trap - EXIT
+
+case "$address" in
+	[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]) ;;
+	*) log 'invalid native Bluetooth address in EFS'; exit 0 ;;
+esac
+
+# --- nothing to do if it is already applied ----------------------------------
+if [ "$(current_address)" = "$address" ]; then
+	log 'the native address is already active'
+	exit 0
+fi
+
+# --- wait for the management interface to accept the controller --------------
+i=0
+while [ "$i" -lt "$deadline" ]; do
+	if btmgmt_ config | grep -q '^hci0:'; then
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+
+if ! btmgmt_ config | grep -q '^hci0:'; then
+	log 'hci0 is not in the unconfigured list; not forcing an address'
+	exit 0
+fi
+
+btmgmt_ --index 0 public-addr "$address" >/dev/null
+
+# Setting the address makes the controller re-initialise, so the change is not
+# visible immediately: a single read one second later still reported the old
+# address while the controller was in fact already coming up correctly.  Poll
+# instead of guessing a delay, and judge by what the hardware reports rather
+# than by btmgmt's exit code.
+i=0
+while [ "$i" -lt 15 ]; do
+	now=$(current_address)
+	[ "$now" = "$address" ] && break
+	sleep 1
+	i=$((i + 1))
+done
+
+now=$(current_address)
+if [ "$now" = "$address" ]; then
+	log "applied the native address after ${i}s; hci0 is now $now"
+else
+	log "the address did not take; hci0 is still $now"
+fi
+exit 0
